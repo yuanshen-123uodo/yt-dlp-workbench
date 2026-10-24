@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -376,6 +377,77 @@ def snapshot():
         "canceled": sum(1 for i in items if i["status"] == "canceled"),
     }
     return items, stats
+
+
+def safe_rmtree(path):
+    """静默清理临时目录，失败就算了。
+
+    清理只是收尾动作，绝不能影响任务状态：
+    - 某些安全软件 / 组策略会拦截批量删除（一次删几百个文件直接抛异常）；
+    - 文件被占用时 rmtree 也会失败。
+    因此吞掉所有异常，最多重试一次。
+    """
+    if not path or not os.path.isdir(path):
+        return
+    for _ in range(2):
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except BaseException:
+            pass
+        if not os.path.isdir(path):
+            return
+        try:
+            time.sleep(0.4)
+        except BaseException:
+            return
+
+
+def defer_rmtree(path):
+    """把临时目录清理丢到后台线程。
+
+    删除几百个帧文件在某些环境下会非常慢甚至卡住（安全软件逐个扫描 / 拦截）。
+    放到后台后，任务状态可以先回写「已完成」，用户立即能拿到成品。
+    """
+    try:
+        threading.Thread(target=safe_rmtree, args=(path,), daemon=True).start()
+    except BaseException:
+        pass
+
+
+def guard_stuck():
+    """兜底守卫：处理类任务若长时间（15 分钟）进度毫无变化、且没有子进程存活，
+    视为异常中断，自动结束并标记失败。避免任务永远停在「处理中」。
+    只针对 processing（超分 / 去水印等本地处理），不干扰正常下载的慢速重试。
+    """
+    seen = {}
+    while True:
+        time.sleep(20)
+        try:
+            now = time.time()
+            hits = []
+            with task_lock:
+                for tid in list(TASK_ORDER):
+                    t = TASKS.get(tid)
+                    if not t or t.get("status") != "processing":
+                        seen.pop(tid, None)
+                        continue
+                    key = (round(float(t.get("percent") or 0), 1), t.get("phase") or "")
+                    rec = seen.get(tid)
+                    if not rec or rec[0] != key:
+                        seen[tid] = (key, now)
+                        continue
+                    if now - rec[1] > 900 and tid not in PROCS:
+                        t["status"] = "error"
+                        t["phase"] = "已中断"
+                        t["error"] = "任务长时间无响应，已自动结束（可重新发起）"
+                        t["finished"] = now
+                        hits.append(tid)
+                for tid in hits:
+                    seen.pop(tid, None)
+            for tid in hits:
+                add_log("任务 %s 长时间无进度且无进程存活，已标记为中断" % tid, tid, "warn")
+        except Exception:
+            pass
 
 
 def push_history(task):
@@ -775,7 +847,7 @@ def process_frames_wm(task, src, dst, regions, info, engine):
         [FFMPEG, "-y", "-v", "error",
          "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "%dx%d" % (W, H),
          "-r", str(fps), "-i", "pipe:0",
-         "-i", src, "-map", "0:v:0", "-map", "1:a?",
+         "-i", src, "-map", "0:v:0", "-map", "1:a:0?", "-dn", "-sn", "-map_chapters", "-1",
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
          "-pix_fmt", "yuv420p", "-movflags", "+faststart",
          "-c:a", "copy", dst],
@@ -1017,7 +1089,7 @@ def process_frames_ai(task, src, dst, regions, info):
         [FFMPEG, "-y", "-v", "error",
          "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "%dx%d" % (W, H),
          "-r", str(fps), "-i", "pipe:0",
-         "-i", src, "-map", "0:v:0", "-map", "1:a?",
+         "-i", src, "-map", "0:v:0", "-map", "1:a:0?", "-dn", "-sn", "-map_chapters", "-1",
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
          "-pix_fmt", "yuv420p", "-movflags", "+faststart",
          "-c:a", "copy", dst],
@@ -1088,6 +1160,280 @@ def _sample_gray_frames(path, info, count=8, tw=320):
     for i in range(len(buf) // fs):
         out.append(np.frombuffer(buf[i * fs:(i + 1) * fs], np.uint8).reshape(th, tw).astype(np.float32))
     return out, th, tw
+
+
+# ---------------------------------------------------------------- 画质提升
+# Real-ESRGAN ncnn-vulkan：单文件 exe + 模型，不依赖 Python/PyTorch/CUDA，
+# 通过 Vulkan 调用显卡。工具约 45MB，首次使用时下载。
+UP_DIR = os.path.join(APP_DIR, "tools", "realesrgan")
+UP_EXE = os.path.join(UP_DIR, "realesrgan-ncnn-vulkan.exe")
+UP_MODELS = os.path.join(UP_DIR, "models")
+UP_STATE = {"ready": None, "error": "", "models": []}
+UP_ASSET = "realesrgan-ncnn-vulkan-20220424-windows.zip"
+UP_GH = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/" + UP_ASSET
+# 顺序尝试：国内镜像优先（GitHub 直连在部分网络下只有 10KB/s）
+UP_ZIP_URLS = [
+    ("https://ghfast.top/" + UP_GH, {}),
+    ("https://ghproxy.net/" + UP_GH, {}),
+    ("https://api.github.com/repos/xinntao/Real-ESRGAN/releases/assets/63494469",
+     {"Accept": "application/octet-stream"}),
+    (UP_GH, {}),
+]
+UP_ZIP_URL = UP_ZIP_URLS[0][0]
+
+# 模型说明（zip 里实际有哪些会动态扫描，这里只给友好名）
+UP_MODEL_LABEL = {
+    "realesrgan-x4plus": "通用高质量（慢，细节最好）",
+    "realesrgan-x4plus-anime": "动漫高质量（慢）",
+    "realesr-animevideov3": "动漫视频（快，推荐动漫）",
+    "realesr-general-x4v3": "通用轻量（快）",
+    "realesr-general-wdn-x4v3": "通用轻量 + 强降噪",
+}
+
+
+def upscale_models():
+    """扫描已安装的模型（去掉 -x2/-x3/-x4 后缀，倍率由 -s 参数决定）。"""
+    out = []
+    if os.path.isdir(UP_MODELS):
+        for f in sorted(os.listdir(UP_MODELS)):
+            if f.endswith(".param"):
+                name = re.sub(r"-x[234]$", "", f[:-6])
+                if name not in out:
+                    out.append(name)
+    return out
+
+
+def upscale_status():
+    global UP_STATE
+    if UP_STATE["ready"] is not None:
+        return UP_STATE
+    if not os.path.isfile(UP_EXE):
+        UP_STATE = {"ready": False, "error": "未安装 Real-ESRGAN 引擎", "models": []}
+        return UP_STATE
+    models = upscale_models()
+    if not models:
+        UP_STATE = {"ready": False, "error": "引擎缺少模型文件", "models": []}
+        return UP_STATE
+    UP_STATE = {"ready": True, "error": "", "models": models}
+    return UP_STATE
+
+
+def setup_upscale():
+    """下载并解压 Real-ESRGAN 引擎（约 45MB）。返回 (ok, message)。"""
+    global UP_STATE
+    if os.path.isfile(UP_EXE) and upscale_models():
+        UP_STATE = {"ready": True, "error": "", "models": upscale_models()}
+        return True, "引擎已就绪"
+    cache_dir = os.path.join(APP_DIR, "cache")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(UP_DIR, exist_ok=True)
+    except Exception as e:
+        return False, "创建目录失败：%s" % e
+
+    zpath = os.path.join(cache_dir, "realesrgan.zip")
+    # 已下载过且完整则直接解压
+    ok_zip = False
+    if os.path.isfile(zpath) and os.path.getsize(zpath) > 30 * 1048576:
+        try:
+            import zipfile
+            with zipfile.ZipFile(zpath) as z:
+                ok_zip = z.testzip() is None
+        except Exception:
+            ok_zip = False
+
+    if not ok_zip:
+        import urllib.request
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        errs = []
+        for url, extra in UP_ZIP_URLS:
+            try:
+                req = urllib.request.Request(url)
+                for k, v in extra.items():
+                    req.add_header(k, v)
+                req.add_header("User-Agent", "ytdlp-workbench")
+                # timeout 作用于每次读写：镜像挂住时 30 秒内就会换下一个源
+                with urllib.request.urlopen(req, timeout=30, context=ctx) as r, open(zpath, "wb") as f:
+                    while True:
+                        chunk = r.read(262144)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                if os.path.getsize(zpath) > 30 * 1048576:
+                    ok_zip = True
+                    break
+                errs.append("%s -> 文件不完整" % url.split("/")[2])
+            except Exception as e:
+                errs.append("%s -> %s" % (url.split("/")[2], str(e)[:60]))
+        if not ok_zip:
+            try:
+                os.remove(zpath)
+            except Exception:
+                pass
+            return False, "下载失败：%s" % ("；".join(errs) or "未知错误")
+
+    try:
+        import zipfile
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(UP_DIR)
+    except Exception as e:
+        return False, "解压失败：%s" % e
+
+    # zip 里可能多包一层目录，把内容上移
+    if not os.path.isfile(UP_EXE):
+        for root, _dirs, files in os.walk(UP_DIR):
+            if "realesrgan-ncnn-vulkan.exe" in files:
+                for item in os.listdir(root):
+                    srcp = os.path.join(root, item)
+                    dstp = os.path.join(UP_DIR, item)
+                    if os.path.abspath(srcp) == os.path.abspath(dstp):
+                        continue
+                    try:
+                        shutil.move(srcp, dstp)
+                    except Exception:
+                        pass
+                break
+    try:
+        os.remove(zpath)
+    except Exception:
+        pass
+
+    if not os.path.isfile(UP_EXE):
+        return False, "解压后找不到 realesrgan-ncnn-vulkan.exe"
+    models = upscale_models()
+    if not models:
+        return False, "解压后找不到模型文件"
+    UP_STATE = {"ready": True, "error": "", "models": models}
+    total = 0
+    for root, _dirs, files in os.walk(UP_DIR):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return True, "引擎安装完成（%d 个模型，%.0f MB）" % (len(models), total / 1048576.0)
+
+
+def process_upscale(task, src, dst, opts):
+    """画质提升管线：抽帧 → Real-ESRGAN 超分 → 合帧（音频直通）。"""
+    tid = task["id"]
+    st = upscale_status()
+    if not st.get("ready"):
+        add_log("画质提升跳过：%s" % (st.get("error") or "引擎未就绪"), tid, "warn")
+        return False
+
+    info = probe_video(src)
+    if not info or not info.get("w"):
+        add_log("画质提升失败：读不到视频信息", tid, "error")
+        return False
+    W, H = int(info["w"]), int(info["h"])
+    fps = info.get("fps") or probe_fps(src)
+    scale = int(opts.get("scale") or 2)
+    if scale not in (2, 3, 4):
+        scale = 2
+    models = st.get("models") or []
+    model = opts.get("model") or ""
+    if model not in models:
+        # 默认：动漫视频模型最轻快，其次通用
+        for pref in ("realesr-animevideov3", "realesr-general-x4v3", "realesrgan-x4plus"):
+            if pref in models:
+                model = pref
+                break
+        else:
+            model = models[0]
+
+    work = os.path.join(APP_DIR, "cache", "up_" + tid)
+    fin = os.path.join(work, "in")
+    fout = os.path.join(work, "out")
+    safe_rmtree(work)
+    try:
+        os.makedirs(fin, exist_ok=True)
+        os.makedirs(fout, exist_ok=True)
+    except Exception as e:
+        add_log("画质提升失败：无法创建临时目录 %s" % e, tid, "error")
+        return False
+
+    add_log("画质提升：%dx%d → %dx%d，模型 %s，抽帧中…" % (W, H, W * scale, H * scale, model), tid)
+    with task_lock:
+        task["percent"] = 0.0
+
+    try:
+        # 1) 抽帧（JPEG q2，兼顾体积与质量）
+        r = subprocess.run(
+            [FFMPEG, "-y", "-v", "error", "-i", src, "-q:v", "2",
+             os.path.join(fin, "%08d.jpg")],
+            capture_output=True, timeout=7200, creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            add_log("抽帧失败：%s" % (r.stderr or b"").decode("utf-8", "replace")[:300], tid, "error")
+            return False
+        frames = sorted(f for f in os.listdir(fin) if f.endswith(".jpg"))
+        total = len(frames)
+        if not total:
+            add_log("抽帧失败：没有输出帧", tid, "error")
+            return False
+        add_log("画质提升：共 %d 帧，开始超分（可最小化窗口，进度见任务列表）" % total, tid)
+
+        # 2) 超分
+        proc = subprocess.Popen(
+            [UP_EXE, "-i", fin, "-o", fout, "-n", model, "-s", str(scale),
+             "-t", "0", "-f", "jpg", "-j", "1:2:2"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, bufsize=0,
+            creationflags=CREATE_NO_WINDOW, cwd=UP_DIR,
+        )
+        PROCS[tid] = proc
+        for raw in proc.stdout:
+            line = decode_line(raw)
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+            if m:
+                pct = float(m.group(1))
+                with task_lock:
+                    task["percent"] = min(90.0, pct * 0.9)
+                    task["phase"] = "超分中 %d/%d 帧" % (int(pct * total / 100), total)
+            if task.get("cancel"):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
+        code = proc.wait()
+        PROCS.pop(tid, None)
+        if code != 0 or task.get("cancel"):
+            add_log("超分中断（退出码 %d）" % code, tid, "warn")
+            return False
+
+        outs = sorted(f for f in os.listdir(fout) if f.endswith(".jpg"))
+        if not outs:
+            add_log("超分失败：没有输出帧", tid, "error")
+            return False
+
+        # 3) 合帧 + 音频直通
+        add_log("画质提升：合帧编码中（%d 帧）…" % len(outs), tid)
+        with task_lock:
+            task["percent"] = 90.0
+            task["phase"] = "合帧编码"
+        r = subprocess.run(
+            [FFMPEG, "-y", "-v", "error",
+             "-framerate", str(fps), "-i", os.path.join(fout, "%08d.jpg"),
+             "-i", src, "-map", "0:v:0", "-map", "1:a:0?", "-dn", "-sn",
+             # 章节会让 mp4 封装额外写一条 text 轨道（部分播放器识别成坏字幕流），去掉
+             "-map_chapters", "-1",
+             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+             "-c:a", "copy", dst],
+            capture_output=True, timeout=7200, creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            add_log("合帧失败：%s" % (r.stderr or b"").decode("utf-8", "replace")[:300], tid, "error")
+            return False
+        with task_lock:
+            task["percent"] = 100.0
+        return True
+    finally:
+        defer_rmtree(work)
 
 
 def detect_watermarks(path):
@@ -1946,6 +2292,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- API
     def api_get(self, path):
+        if path == "/api/upscale/status":
+            st = upscale_status()
+            return self._send(200, {
+                "ok": True,
+                "ready": bool(st.get("ready")),
+                "error": st.get("error") or "",
+                "models": [{"name": m, "label": UP_MODEL_LABEL.get(m, m)}
+                           for m in (st.get("models") or [])],
+            })
         if path == "/api/thumb":
             # 视频首帧缩略图（编辑器 poster，打开即有画面）
             q = urlparse(self.path).query
@@ -2013,6 +2368,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/tasks":
             items, stats = snapshot()
             return self._send(200, {"ok": True, "tasks": items, "stats": stats})
+        if path == "/api/debug/threads":
+            import traceback as _tb
+            frames = sys._current_frames()
+            names = {t.ident: t.name for t in threading.enumerate()}
+            out = {}
+            for ident, fr in frames.items():
+                out[names.get(ident) or str(ident)] = _tb.format_stack(fr)[-14:]
+            return self._send(200, {"ok": True, "threads": out})
         if path.startswith("/api/logs"):
             q = urlparse(self.path).query
             after = 0
@@ -2213,6 +2576,67 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ai/setup":
             ok, msg = setup_ai_engine()
             return self._send(200, {"ok": ok, "message": msg})
+
+        if path == "/api/upscale/setup":
+            ok, msg = setup_upscale()
+            return self._send(200, {"ok": ok, "message": msg})
+        if path == "/api/upscale/apply":
+            src_id = (body.get("id") or "").strip()
+            with task_lock:
+                src_task = dict(TASKS.get(src_id) or {})
+            src_path = resolve_existing(src_task.get("filename") or "")
+            if not src_path or not os.path.isfile(src_path):
+                return self._send(200, {"ok": False, "error": "任务不存在或文件已删除"})
+            st = upscale_status()
+            if not st.get("ready"):
+                return self._send(200, {"ok": False, "error": st.get("error") or "引擎未就绪"})
+            try:
+                scale = int(body.get("scale") or 2)
+            except Exception:
+                scale = 2
+            if scale not in (2, 3, 4):
+                scale = 2
+            model = (body.get("model") or "").strip()
+            opts = dict(src_task.get("opts") or {})
+            t = create_task(src_task.get("url") or "", opts)
+            t["filename"] = src_path
+            t["title"] = (src_task.get("title") or "视频") + " · %dx 超分" % scale
+            t["title_auto"] = False
+            t["status"] = "processing"
+            t["phase"] = "画质提升"
+            t["started"] = time.time()
+            base = os.path.splitext(src_path)[0]
+            out = base + ".up%dx.mp4" % scale
+
+            def up_worker():
+                # 必须捕获 BaseException：收尾清理等环节可能抛出非 Exception 的异常
+                # （安全软件拦截批量删除就是这种），否则线程直接退出，任务永远卡在处理中
+                ok = False
+                try:
+                    ok = process_upscale(t, src_path, out, {"scale": scale, "model": model})
+                except BaseException as e:
+                    try:
+                        add_log("画质提升异常：%s" % (e or type(e).__name__), t["id"], "error")
+                    except BaseException:
+                        pass
+                    ok = False
+                with task_lock:
+                    t["finished"] = time.time()
+                    if ok and os.path.isfile(out):
+                        t["filename"] = out
+                        t["total"] = os.path.getsize(out)
+                        t["status"] = "done"
+                        t["percent"] = 100.0
+                        t["phase"] = "已完成"
+                        t["up_done"] = True
+                    elif t.get("cancel"):
+                        t["status"] = "canceled"
+                    else:
+                        t["status"] = "error"
+                        t["error"] = "画质提升失败，详见运行日志"
+
+            threading.Thread(target=up_worker, daemon=True).start()
+            return self._send(200, {"ok": True, "id": t["id"], "out": out})
         if path == "/api/wm/detect":
             target = (body.get("path") or "").strip()
             tid = (body.get("id") or "").strip()
@@ -2253,10 +2677,14 @@ class Handler(BaseHTTPRequestHandler):
             t["started"] = time.time()
 
             def worker():
+                ok = False
                 try:
                     ok = apply_watermark(t)
-                except Exception as e:
-                    add_log("去水印异常：%s" % e, t["id"], "error")
+                except BaseException as e:
+                    try:
+                        add_log("去水印异常：%s" % (e or type(e).__name__), t["id"], "error")
+                    except BaseException:
+                        pass
                     ok = False
                 with task_lock:
                     t["finished"] = time.time()
@@ -2421,6 +2849,7 @@ def main():
     port = pick_port()
     url = "http://127.0.0.1:%d" % port
     threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=guard_stuck, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     srv.daemon_threads = True
     print("=" * 56)

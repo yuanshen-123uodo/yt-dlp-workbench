@@ -274,6 +274,45 @@
   </section>
 </main>
 
+<!-- ==================== 画质提升 ==================== -->
+<div class="modal hidden" id="upModal">
+  <div class="modal-box up-box">
+    <div class="modal-head">
+      <div>
+        <h3>画质提升（AI 超分）</h3>
+        <p class="modal-sub" id="upSub">用 Real-ESRGAN 把画面放大并补细节</p>
+      </div>
+      <button class="icon-btn" id="upClose" title="关闭">✕</button>
+    </div>
+    <div class="modal-body up-body">
+      <div class="up-preview">
+        <img id="upThumb" alt="预览" />
+        <div class="up-badge" id="upBadge">—</div>
+      </div>
+      <aside class="up-side">
+        <div class="field">
+          <label class="lab">放大倍率</label>
+          <div class="seg small" id="upScale">
+            <button class="seg-btn active" data-scale="2">2×</button>
+            <button class="seg-btn" data-scale="3">3×</button>
+            <button class="seg-btn" data-scale="4">4×</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="lab">模型</label>
+          <select id="upModel" class="input"></select>
+        </div>
+        <div class="up-engine" id="upEngine">
+          <span id="upEngineState">检查引擎…</span>
+          <button class="btn btn-soft sm" id="upSetup">下载引擎（45MB）</button>
+        </div>
+        <p class="sec-note" id="upNote">有独显时约 15–20 分钟 / 分钟视频；核显会慢 3–5 倍</p>
+        <button class="btn btn-primary wm-run" id="upRun">开始提升</button>
+      </aside>
+    </div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
 <!-- ==================== 去水印编辑器 ==================== -->

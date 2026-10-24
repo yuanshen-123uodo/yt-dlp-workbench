@@ -248,6 +248,7 @@ function updateCard(c, t) {
   } else if (t.status === "done") {
     acts.push(`<button class="icon-btn" data-act="openfile" title="播放 / 打开文件">▶</button>`);
     acts.push(`<button class="icon-btn" data-act="wm" title="去水印（框选区域）">✂</button>`);
+    acts.push(`<button class="icon-btn" data-act="upscale" title="画质提升（AI 超分）">⬆</button>`);
     acts.push(`<button class="icon-btn" data-act="openfolder" title="打开所在目录">📁</button>`);
   } else {
     acts.push(`<button class="icon-btn" data-act="retry" title="重试">↻</button>`);
@@ -282,6 +283,8 @@ $("#tasks").addEventListener("click", async (e) => {
     if (!r.ok) toast(r.error || "文件不存在", "err");
   } else if (act === "wm") {
     wmOpen(id);
+  } else if (act === "upscale") {
+    upscaleOpen(id);
   } else if (act === "openfolder") {
     const r = await api("/api/open", { path: t?.filename || $("#outdir").value });
     if (!r.ok) toast(r.error || "打开失败", "err");
@@ -1015,4 +1018,100 @@ window.addEventListener("keydown", (e) => {
     }
   }
   if (e.key === "Escape") wmClose();
+});
+
+/* ================================================ 画质提升 */
+const upS = { taskId: "", W: 0, H: 0, scale: 2, ready: false, models: [] };
+
+function upUpdateBadge() {
+  const s = upS.scale;
+  $("#upBadge").textContent = upS.W
+    ? `${upS.W}×${upS.H} → ${upS.W * s}×${upS.H * s}`
+    : `${s}× 放大`;
+}
+
+async function upscaleOpen(taskId) {
+  const t = state.tasks.get(taskId);
+  if (!t || !t.filename) return toast("找不到文件，可能已被移动", "err");
+  upS.taskId = taskId;
+  upS.scale = 2;
+  upS.W = 0;
+  upS.H = 0;
+  $("#upModal").classList.remove("hidden");
+  $("#upSub").textContent = t.title || "";
+  const thumb = $("#upThumb");
+  thumb.classList.remove("hidden");
+  thumb.src = "/api/thumb?path=" + encodeURIComponent(t.filename);
+  $$("#upScale .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.scale === "2"));
+  upUpdateBadge();
+
+  const info = await api("/api/upscale/status");
+  upS.ready = !!info.ready;
+  upS.models = info.models || [];
+  $("#upModel").innerHTML = upS.models.length
+    ? upS.models.map((m) => `<option value="${esc(m.name)}">${esc(m.label)}</option>`).join("")
+    : '<option value="">（引擎未安装）</option>';
+  const box = $("#upEngine");
+  box.classList.toggle("ready", upS.ready);
+  $("#upEngineState").textContent = upS.ready
+    ? `引擎就绪 · ${upS.models.length} 个模型`
+    : (info.error || "引擎未安装");
+
+  // 读视频真实尺寸
+  const v = document.createElement("video");
+  v.preload = "metadata";
+  v.muted = true;
+  v.src = "/api/media?path=" + encodeURIComponent(t.filename);
+  v.onloadedmetadata = () => {
+    upS.W = v.videoWidth;
+    upS.H = v.videoHeight;
+    upUpdateBadge();
+  };
+}
+
+function upscaleClose() {
+  $("#upModal").classList.add("hidden");
+  $("#upThumb").removeAttribute("src");
+}
+
+async function upscaleRun() {
+  if (!upS.ready) return toast("请先点「下载引擎」", "warn");
+  const model = $("#upModel").value;
+  const btn = $("#upRun");
+  btn.disabled = true;
+  const r = await api("/api/upscale/apply", { id: upS.taskId, scale: upS.scale, model });
+  btn.disabled = false;
+  if (r.ok) {
+    toast(`已开始 ${upS.scale}× 画质提升，进度看任务列表`, "ok", 4500);
+    upscaleClose();
+  } else {
+    toast(r.error || "提交失败", "err");
+  }
+}
+
+$("#upClose")?.addEventListener("click", upscaleClose);
+$("#upRun")?.addEventListener("click", upscaleRun);
+$("#upScale")?.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-scale]");
+  if (!b) return;
+  upS.scale = +b.dataset.scale;
+  $$("#upScale .seg-btn").forEach((x) => x.classList.toggle("active", x === b));
+  upUpdateBadge();
+});
+$("#upSetup")?.addEventListener("click", async () => {
+  const b = $("#upSetup");
+  b.disabled = true;
+  b.textContent = "下载中…（约 45MB）";
+  const r = await api("/api/upscale/setup", {});
+  b.disabled = false;
+  b.textContent = "下载引擎（45MB）";
+  toast(r.message || (r.ok ? "完成" : "失败"), r.ok ? "ok" : "err", 6000);
+  if (r.ok) {
+    const info = await api("/api/upscale/status");
+    upS.ready = !!info.ready;
+    upS.models = info.models || [];
+    $("#upModel").innerHTML = upS.models.map((m) => `<option value="${esc(m.name)}">${esc(m.label)}</option>`).join("");
+    $("#upEngine").classList.add("ready");
+    $("#upEngineState").textContent = `引擎就绪 · ${upS.models.length} 个模型`;
+  }
 });
