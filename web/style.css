@@ -506,7 +506,7 @@ kbd{
 .wm-track-row .btn{width:100%;justify-content:center;font-size:11.5px;padding:7px 8px}
 
 /* 完成的任务常显操作按钮，便于发现「去水印」 */
-.task.done .t-actions{opacity:1}
+.task.done .t-actions{opacity:1;flex-direction:row;align-items:center}
 
 /* ---------------- 画质提升 ---------------- */
 .up-box{width:min(780px,100%)}

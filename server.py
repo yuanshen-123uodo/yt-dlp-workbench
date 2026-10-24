@@ -15,7 +15,7 @@ import time
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 try:
     import numpy as np
@@ -1684,7 +1684,9 @@ def apply_watermark(task):
 
     base = os.path.splitext(path)[0]
     tmp = base + ".__wm.mp4"
-    final = base + ".mp4"
+    # 本地导入的文件绝不能覆盖或删除原件，结果另存一份
+    is_local = bool(task.get("local"))
+    final = (base + "_去水印.mp4") if is_local else (base + ".mp4")
     dur = info.get("duration") or 0
 
     with task_lock:
@@ -1718,6 +1720,7 @@ def apply_watermark(task):
         cmd = [
             FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
             "-i", path, "-vf", vf,
+            "-map", "0:v:0", "-map", "0:a:0?", "-dn", "-sn", "-map_chapters", "-1",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             "-c:a", "copy",
@@ -1757,12 +1760,13 @@ def apply_watermark(task):
     if code == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
         try:
             os.replace(tmp, final)
-            if os.path.normcase(path) != os.path.normcase(final) and os.path.isfile(path):
+            if (not is_local) and os.path.normcase(path) != os.path.normcase(final) and os.path.isfile(path):
                 os.remove(path)
             with task_lock:
                 task["filename"] = final
                 task["total"] = os.path.getsize(final)
                 task["wm_done"] = True
+                task["local"] = is_local and True or task.get("local", False)
             add_log("✔ 去水印完成：%s" % os.path.basename(final), tid, "ok")
             return True
         except Exception as e:
@@ -2094,6 +2098,70 @@ def create_task(url, opts):
     return task
 
 
+LOCAL_EXTS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".ts", ".m4v", ".wmv",
+    ".mpg", ".mpeg", ".m2ts", ".3gp", ".ogv", ".rmvb", ".vob",
+    ".m4a", ".mp3", ".aac", ".flac", ".wav", ".ogg", ".opus", ".wma",
+}
+
+
+def local_path_of(text):
+    """判断输入是否是一个已存在的本地媒体文件路径（支持带引号、file:// 前缀）。"""
+    s = (text or "").strip().strip('"').strip("'")
+    if s.lower().startswith("file://"):
+        s = unquote(s[7:])
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:", s):
+            s = s[1:].replace("/", "\\")
+    if not s or not os.path.isabs(s):
+        return ""
+    ext = os.path.splitext(s)[1].lower()
+    if ext not in LOCAL_EXTS:
+        return ""
+    return s if os.path.isfile(s) else ""
+
+
+def import_local(paths):
+    """把本地媒体文件导入任务队列，生成一条「已完成」条目。
+
+    这样超分 / 去水印这些后期能力就能直接作用在已有文件上，
+    不再局限于刚从网上下载的内容。原文件不会被修改。
+    返回 (ids, errors)。
+    """
+    ids, errs = [], []
+    for raw in paths or []:
+        p = resolve_existing((raw or "").strip()) or (raw or "").strip()
+        if not p or not os.path.isfile(p):
+            errs.append("文件不存在：%s" % os.path.basename(str(raw)))
+            continue
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in LOCAL_EXTS:
+            errs.append("不支持的文件类型：%s" % os.path.basename(p))
+            continue
+        p = os.path.abspath(p)
+        info = probe_video(p) or {}
+        t = create_task("", {})
+        with task_lock:
+            t["host"] = "本地文件"
+            t["title"] = os.path.splitext(os.path.basename(p))[0]
+            t["title_auto"] = False
+            t["filename"] = p
+            t["total"] = os.path.getsize(p)
+            t["status"] = "done"
+            t["phase"] = "本地导入"
+            t["percent"] = 100.0
+            t["local"] = True
+            t["width"] = info.get("w") or 0
+            t["height"] = info.get("h") or 0
+            t["duration"] = info.get("duration") or 0
+            t["thumb"] = "/api/thumb?path=" + quote(p)
+            t["started"] = 0
+            t["finished"] = 0
+        ids.append(t["id"])
+        add_log("导入本地文件：%s" % os.path.basename(p), t["id"], "ok")
+    return ids, errs
+
+
+
 # ---------------------------------------------------------------- 元信息解析
 
 INFO_LOCK = threading.Lock()
@@ -2416,10 +2484,16 @@ class Handler(BaseHTTPRequestHandler):
             if not urls:
                 return self._send(400, {"ok": False, "error": "没有可下载的链接"})
             ids = []
+            local_paths = []
             mode = opts.get("mode") or "merge"
             for u in urls:
                 u = (u or "").strip()
                 if not u or u.startswith("#"):
+                    continue
+                # 粘贴的是本地文件路径时，直接走导入，不再当成链接下载
+                lp = local_path_of(u)
+                if lp:
+                    local_paths.append(lp)
                     continue
                 if mode == "split":
                     vo = dict(opts)
@@ -2434,6 +2508,11 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     t = create_task(u, dict(opts))
                     ids.append(t["id"])
+            if local_paths:
+                lids, lerrs = import_local(local_paths)
+                ids.extend(lids)
+                for e in lerrs:
+                    add_log(e, None, "warn")
             add_log("已加入队列 %d 个任务%s" % (len(ids), "（双轨拆分）" if mode == "split" else ""))
             return self._send(200, {"ok": True, "ids": ids})
 
@@ -2518,6 +2597,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "path": p})
             return self._send(200, {"ok": False, "error": "未选择目录"})
 
+        if path == "/api/import":
+            if body.get("pick"):
+                picked = pick_files()
+                if not picked:
+                    return self._send(200, {"ok": False, "cancelled": True, "error": "未选择文件"})
+                paths = picked
+            else:
+                paths = body.get("paths") or ([body["path"]] if body.get("path") else [])
+            if not paths:
+                return self._send(400, {"ok": False, "error": "没有要导入的文件"})
+            ids, errs = import_local(paths)
+            if not ids:
+                return self._send(200, {"ok": False, "error": errs[0] if errs else "导入失败"})
+            return self._send(200, {"ok": True, "ids": ids, "errors": errs})
+
         if path == "/api/open":
             target = resolve_existing(body.get("path") or "") or config.get("outdir")
             try:
@@ -2600,6 +2694,7 @@ class Handler(BaseHTTPRequestHandler):
             opts = dict(src_task.get("opts") or {})
             t = create_task(src_task.get("url") or "", opts)
             t["filename"] = src_path
+            t["local"] = bool(src_task.get("local"))
             t["title"] = (src_task.get("title") or "视频") + " · %dx 超分" % scale
             t["title_auto"] = False
             t["status"] = "processing"
@@ -2669,6 +2764,7 @@ class Handler(BaseHTTPRequestHandler):
             opts["watermark"] = {**wm, "enabled": True}
             t = create_task(src_task.get("url") or "", opts)
             t["filename"] = src_path
+            t["local"] = bool(src_task.get("local"))
             t["title"] = (src_task.get("title") or "视频") + " · 去水印"
             t["title_auto"] = False
             t["status"] = "processing"
@@ -2772,6 +2868,48 @@ def pick_folder():
         return result["path"]
     except Exception:
         return None
+
+
+def pick_files():
+    """系统文件选择器，支持多选。返回路径列表。"""
+    try:
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$d = New-Object System.Windows.Forms.OpenFileDialog;"
+            "$d.Title = '选择要处理的视频或音频文件';"
+            "$d.Multiselect = $true;"
+            "$d.Filter = '媒体文件|*.mp4;*.mkv;*.webm;*.mov;*.avi;*.flv;*.ts;*.m4v;*.wmv;*.mpg;*.mpeg;*.m4a;*.mp3;*.aac;*.flac;*.wav;*.ogg;*.opus|所有文件|*.*';"
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK)"
+            " { foreach ($f in $d.FileNames) { Write-Output $f } }"
+        )
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", ps],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=300, creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            return [l.strip() for l in (r.stdout or "").splitlines() if l.strip()]
+    except Exception:
+        pass
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        result = {"paths": []}
+
+        def work():
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            result["paths"] = list(filedialog.askopenfilenames(title="选择要处理的媒体文件") or [])
+            root.destroy()
+
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        th.join(timeout=300)
+        return result["paths"]
+    except Exception:
+        return []
 
 
 def pick_port(start=8765):

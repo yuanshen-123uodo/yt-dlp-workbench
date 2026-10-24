@@ -496,6 +496,25 @@ $("#btnClearLog").addEventListener("click", async () => {
     state.logSeq = 0;
   }
 });
+$("#btnImport").addEventListener("click", async () => {
+  const b = $("#btnImport");
+  const old = b.innerHTML;
+  b.disabled = true;
+  b.textContent = "选择文件…";
+  try {
+    const r = await api("/api/import", { pick: true });
+    if (r.cancelled) return;
+    if (!r.ok) return toast(r.error || "导入失败", "err", 3600);
+    toast(`已导入 ${r.ids.length} 个文件`, "ok", 2200);
+    if (r.errors && r.errors.length) toast(r.errors[0], "warn", 3600);
+    pollTasks();
+  } catch (e) {
+    toast("导入失败：" + e.message, "err", 3600);
+  } finally {
+    b.disabled = false;
+    b.innerHTML = old;
+  }
+});
 $("#btnClearDone").addEventListener("click", async () => {
   await api("/api/clear", { mode: "finished" });
   toast("已清理结束的任务", "ok", 1600);
