@@ -289,12 +289,19 @@
     <div class="modal-body">
       <div class="wm-stage-wrap">
         <div class="wm-stage" id="wmStage">
-          <video id="wmVideo" controls playsinline preload="metadata"></video>
-          <canvas id="wmCanvas"></canvas>
+          <div class="wm-canvas-wrap" id="wmCanvasWrap">
+            <video id="wmVideo" playsinline preload="auto"></video>
+            <canvas id="wmCanvas"></canvas>
+          </div>
+        </div>
+        <div class="wm-controls">
+          <button class="wm-play" id="wmPlay" title="播放 / 暂停">▶</button>
+          <input type="range" id="wmSeek" class="wm-seek" min="0" max="1000" value="0" step="1" />
+          <span class="wm-time" id="wmTime">0:00 / 0:00</span>
         </div>
         <div class="wm-hint">
           <span>拖拽画框 · 点框选中 · <b>Delete</b> 删除</span>
-          <span id="wmTime">0.0s</span>
+          <span id="wmInfo">加载中…</span>
         </div>
       </div>
 

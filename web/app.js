@@ -632,18 +632,19 @@ function wmPosAt(r, t) {
 
 function wmSyncCanvas() {
   const v = $("#wmVideo"), c = $("#wmCanvas");
-  const stage = $("#wmStage");
-  const vb = v.getBoundingClientRect(), sb = stage.getBoundingClientRect();
+  const vb = v.getBoundingClientRect();
   if (!vb.width || !vb.height) return;
-  c.style.left = (vb.left - sb.left) + "px";
-  c.style.top = (vb.top - sb.top) + "px";
-  c.style.width = vb.width + "px";
-  c.style.height = vb.height + "px";
   const dpr = window.devicePixelRatio || 1;
   c.width = Math.round(vb.width * dpr);
   c.height = Math.round(vb.height * dpr);
   wmS.cw = vb.width;
   wmS.ch = vb.height;
+}
+
+function fmtClock(s) {
+  s = Math.max(0, Math.floor(s || 0));
+  const m = Math.floor(s / 60), sec = s % 60;
+  return m + ":" + String(sec).padStart(2, "0");
 }
 
 function wmRender() {
@@ -697,7 +698,6 @@ function wmRender() {
     ctx.fillStyle = "rgba(53,208,127,.13)";
     ctx.fillRect(x * wmS.cw, y * wmS.ch, w * wmS.cw, h * wmS.ch);
   }
-  $("#wmTime").textContent = t.toFixed(1) + "s";
 }
 
 function wmList() {
@@ -718,6 +718,13 @@ function wmList() {
   }).join("");
 }
 
+function wmUpdateTime() {
+  const v = $("#wmVideo");
+  if (!v.duration || !isFinite(v.duration)) return;
+  $("#wmSeek").value = Math.round((v.currentTime / v.duration) * 1000);
+  $("#wmTime").textContent = fmtClock(v.currentTime) + " / " + fmtClock(v.duration);
+}
+
 async function wmOpen(taskId) {
   const t = state.tasks.get(taskId);
   if (!t || !t.filename) return toast("找不到文件，可能已被移动", "err");
@@ -729,11 +736,41 @@ async function wmOpen(taskId) {
   $("#wmSub").textContent = t.title || "";
   $("#wmRegions").innerHTML = '<p class="wm-empty">正在加载视频…</p>';
   const v = $("#wmVideo");
-  v.src = "/api/media?path=" + encodeURIComponent(t.filename);
+  const enc = encodeURIComponent(t.filename);
+  v.poster = "/api/thumb?path=" + enc;   // 首帧缩略图，打开即有画面
+  v.src = "/api/media?path=" + enc;
+  $("#wmPlay").textContent = "▶";
   v.onloadedmetadata = () => {
     wmS.W = v.videoWidth;
     wmS.H = v.videoHeight;
-    setTimeout(() => { wmSyncCanvas(); wmRender(); wmList(); }, 60);
+    $("#wmInfo").textContent = v.videoWidth + "×" + v.videoHeight + " · " + fmtClock(v.duration);
+    // 浏览器在无用户交互时只拉元数据不拉画面（readyState 停在 1），
+    // 这里静音播一下再暂停，强制渲染首帧，避免编辑器一打开是黑屏
+    v.muted = true;
+    const kick = v.play();
+    if (kick && kick.then) {
+      kick.then(() => {
+        setTimeout(() => {
+          try { v.pause(); v.currentTime = 0.05; } catch (e) {}
+          v.muted = false;
+          wmSyncCanvas(); wmRender(); wmUpdateTime();
+        }, 200);
+      }).catch(() => {
+        v.muted = false;
+        setTimeout(() => { wmSyncCanvas(); wmRender(); wmUpdateTime(); }, 100);
+      });
+    }
+    setTimeout(() => { wmSyncCanvas(); wmRender(); wmList(); wmUpdateTime(); }, 150);
+  };
+  v.oncanplay = () => {
+    $("#wmInfo").textContent = v.videoWidth + "×" + v.videoHeight + " · " + fmtClock(v.duration);
+    wmSyncCanvas(); wmRender();
+  };
+  v.onloadeddata = () => { wmSyncCanvas(); wmRender(); };
+  v.onerror = () => {
+    const err = v.error ? ("代码 " + v.error.code) : "";
+    $("#wmInfo").textContent = "加载失败 " + err;
+    toast("视频加载失败" + (err ? "（" + err + "）" : "") + "，可能是编码不被浏览器支持", "err", 6000);
   };
   const st = await api("/api/ai/status");
   wmS.aiReady = !!st.ready;
@@ -747,6 +784,9 @@ function wmClose() {
   const v = $("#wmVideo");
   try { v.pause(); } catch (e) {}
   v.removeAttribute("src");
+  $("#wmSeek").value = 0;
+  $("#wmTime").textContent = "0:00 / 0:00";
+  $("#wmPlay").textContent = "▶";
 }
 
 /* 画布交互 */
@@ -843,9 +883,29 @@ function wmClose() {
     if (row) { wmS.sel = +row.dataset.i; wmList(); wmRender(); }
   });
 
-  $("#wmVideo").addEventListener("timeupdate", wmRender);
-  $("#wmVideo").addEventListener("seeked", wmRender);
-  window.addEventListener("resize", () => { if (!$("#wmModal").classList.contains("hidden")) { wmSyncCanvas(); wmRender(); } });
+  // ---- 播放控制（画布只盖画面，控制条独立，互不遮挡）
+  const v = $("#wmVideo");
+  $("#wmPlay").addEventListener("click", () => {
+    if (v.paused) {
+      v.play().catch(() => toast("无法播放：编码可能不被浏览器支持", "err", 5000));
+    } else {
+      v.pause();
+    }
+  });
+  v.addEventListener("play", () => { $("#wmPlay").textContent = "❚❚"; });
+  v.addEventListener("pause", () => { $("#wmPlay").textContent = "▶"; });
+  v.addEventListener("ended", () => { $("#wmPlay").textContent = "▶"; });
+  v.addEventListener("timeupdate", () => { wmUpdateTime(); wmRender(); });
+  v.addEventListener("seeked", () => { wmUpdateTime(); wmRender(); });
+  $("#wmSeek").addEventListener("input", (e) => {
+    if (v.duration && isFinite(v.duration)) {
+      v.currentTime = (e.target.value / 1000) * v.duration;
+    }
+  });
+
+  window.addEventListener("resize", () => {
+    if (!$("#wmModal").classList.contains("hidden")) { wmSyncCanvas(); wmRender(); }
+  });
 })();
 
 /* 轨迹点记录（按钮动态插入到区域列表上方） */
@@ -938,11 +998,21 @@ $("#wmTrack")?.addEventListener("click", wmAddTrack);
 /* Delete 删除选中区域 */
 window.addEventListener("keydown", (e) => {
   if ($("#wmModal").classList.contains("hidden")) return;
+  const tag = (e.target.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
   if ((e.key === "Delete" || e.key === "Backspace") && wmS.sel >= 0) {
     e.preventDefault();
     wmS.regions.splice(wmS.sel, 1);
     wmS.sel = Math.min(wmS.sel, wmS.regions.length - 1);
     wmList(); wmRender();
+  }
+  if (e.key === " " || e.code === "Space") {
+    const v = $("#wmVideo");
+    if (v && v.duration && isFinite(v.duration)) {
+      e.preventDefault();
+      if (v.paused) v.play().catch(() => {});
+      else v.pause();
+    }
   }
   if (e.key === "Escape") wmClose();
 });

@@ -1875,6 +1875,34 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- API
     def api_get(self, path):
+        if path == "/api/thumb":
+            # 视频首帧缩略图（编辑器 poster，打开即有画面）
+            q = urlparse(self.path).query
+            target = ""
+            for part in q.split("&"):
+                if part.startswith("path="):
+                    target = unquote(part[5:])
+                    break
+            if not target or not os.path.isfile(target) or not FFMPEG:
+                return self._send(404, {"ok": False, "error": "不可用"})
+            try:
+                import hashlib
+                key = hashlib.md5(target.encode("utf-8")).hexdigest()[:16]
+                cache = os.path.join(APP_DIR, "cache")
+                os.makedirs(cache, exist_ok=True)
+                out = os.path.join(cache, "thumb_" + key + ".jpg")
+                if not os.path.isfile(out):
+                    r = subprocess.run(
+                        [FFMPEG, "-y", "-v", "error", "-ss", "1", "-i", target,
+                         "-frames:v", "1", "-vf", "scale=960:-2", "-q:v", "4", out],
+                        capture_output=True, timeout=90, creationflags=CREATE_NO_WINDOW,
+                    )
+                    if r.returncode != 0 or not os.path.isfile(out):
+                        return self._send(404, {"ok": False, "error": "抽帧失败"})
+                with open(out, "rb") as f:
+                    return self._send(200, f.read(), "image/jpeg")
+            except Exception as e:
+                return self._send(500, {"ok": False, "error": str(e)})
         if path == "/api/media":
             # 视频预览流（支持 Range，让浏览器能拖时间轴）
             q = urlparse(self.path).query
