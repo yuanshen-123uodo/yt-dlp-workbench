@@ -247,6 +247,7 @@ function updateCard(c, t) {
     acts.push(`<button class="icon-btn danger" data-act="cancel" title="取消">✕</button>`);
   } else if (t.status === "done") {
     acts.push(`<button class="icon-btn" data-act="openfile" title="播放 / 打开文件">▶</button>`);
+    acts.push(`<button class="icon-btn" data-act="wm" title="去水印（框选区域）">✂</button>`);
     acts.push(`<button class="icon-btn" data-act="openfolder" title="打开所在目录">📁</button>`);
   } else {
     acts.push(`<button class="icon-btn" data-act="retry" title="重试">↻</button>`);
@@ -279,6 +280,8 @@ $("#tasks").addEventListener("click", async (e) => {
   } else if (act === "openfile") {
     const r = await api("/api/openfile", { path: t?.filename || "" });
     if (!r.ok) toast(r.error || "文件不存在", "err");
+  } else if (act === "wm") {
+    wmOpen(id);
   } else if (act === "openfolder") {
     const r = await api("/api/open", { path: t?.filename || $("#outdir").value });
     if (!r.ok) toast(r.error || "打开失败", "err");
@@ -605,3 +608,341 @@ document.addEventListener("keydown", (e) => {
 });
 
 boot();
+
+/* ================================================ 去水印编辑器 */
+const wmS = {
+  taskId: "", W: 0, H: 0, regions: [], sel: -1, drag: null, aiReady: false, cw: 0, ch: 0,
+};
+
+function wmPosAt(r, t) {
+  const tr = r.track || [];
+  if (tr.length < 2) return { x: r.x, y: r.y };
+  if (t <= tr[0].t) return { x: tr[0].x, y: tr[0].y };
+  const last = tr[tr.length - 1];
+  if (t >= last.t) return { x: last.x, y: last.y };
+  for (let i = 0; i < tr.length - 1; i++) {
+    const a = tr[i], b = tr[i + 1];
+    if (t >= a.t && t <= b.t) {
+      const k = (t - a.t) / ((b.t - a.t) || 1);
+      return { x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k };
+    }
+  }
+  return { x: r.x, y: r.y };
+}
+
+function wmSyncCanvas() {
+  const v = $("#wmVideo"), c = $("#wmCanvas");
+  const stage = $("#wmStage");
+  const vb = v.getBoundingClientRect(), sb = stage.getBoundingClientRect();
+  if (!vb.width || !vb.height) return;
+  c.style.left = (vb.left - sb.left) + "px";
+  c.style.top = (vb.top - sb.top) + "px";
+  c.style.width = vb.width + "px";
+  c.style.height = vb.height + "px";
+  const dpr = window.devicePixelRatio || 1;
+  c.width = Math.round(vb.width * dpr);
+  c.height = Math.round(vb.height * dpr);
+  wmS.cw = vb.width;
+  wmS.ch = vb.height;
+}
+
+function wmRender() {
+  const c = $("#wmCanvas");
+  if (!c || !wmS.cw) return;
+  const ctx = c.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, wmS.cw, wmS.ch);
+  const t = $("#wmVideo").currentTime || 0;
+
+  wmS.regions.forEach((r, i) => {
+    const p = wmPosAt(r, t);
+    const x = p.x * wmS.cw, y = p.y * wmS.ch;
+    const w = r.w * wmS.cw, h = r.h * wmS.ch;
+    const on = i === wmS.sel;
+    ctx.setLineDash((r.track || []).length > 1 ? [] : [5, 4]);
+    ctx.lineWidth = on ? 2 : 1.5;
+    ctx.strokeStyle = on ? "#4c8dff" : "rgba(76,141,255,.62)";
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = on ? "rgba(76,141,255,.17)" : "rgba(76,141,255,.06)";
+    ctx.fillRect(x, y, w, h);
+    ctx.setLineDash([]);
+    ctx.fillStyle = on ? "#8fb6ff" : "rgba(140,175,235,.8)";
+    ctx.font = "600 11px Inter, system-ui, sans-serif";
+    ctx.fillText(String(i + 1), x + 4, Math.max(12, y - 5));
+    // 轨迹点
+    if (on && (r.track || []).length) {
+      r.track.forEach((k) => {
+        ctx.beginPath();
+        ctx.arc(k.x * wmS.cw, k.y * wmS.ch, 3, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffb020";
+        ctx.fill();
+      });
+    }
+  });
+
+  if (wmS.drag) {
+    const d = wmS.drag;
+    let x, y, w, h;
+    if (d.mode === "new") {
+      x = Math.min(d.x0, d.x1); y = Math.min(d.y0, d.y1);
+      w = Math.abs(d.x1 - d.x0); h = Math.abs(d.y1 - d.y0);
+    } else {
+      x = d.cur.x; y = d.cur.y; w = d.w0; h = d.h0;
+    }
+    ctx.setLineDash([4, 3]);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "#35d07f";
+    ctx.strokeRect(x * wmS.cw, y * wmS.ch, w * wmS.cw, h * wmS.ch);
+    ctx.fillStyle = "rgba(53,208,127,.13)";
+    ctx.fillRect(x * wmS.cw, y * wmS.ch, w * wmS.cw, h * wmS.ch);
+  }
+  $("#wmTime").textContent = t.toFixed(1) + "s";
+}
+
+function wmList() {
+  const box = $("#wmRegions");
+  $("#wmCount").textContent = wmS.regions.length;
+  if (!wmS.regions.length) {
+    box.innerHTML = '<p class="wm-empty">还没有区域，在左侧画面上拖拽框选</p>';
+    return;
+  }
+  box.innerHTML = wmS.regions.map((r, i) => {
+    const mv = (r.track || []).length > 1;
+    return `<div class="wm-reg ${i === wmS.sel ? "on" : ""}" data-i="${i}">
+      <span class="dot"></span>
+      <span class="nm">区域 ${i + 1} · ${Math.round(r.w * 100)}%×${Math.round(r.h * 100)}%</span>
+      ${mv ? `<span class="mv">轨迹 ${r.track.length}</span>` : ""}
+      <button class="x" data-del="${i}" title="删除">✕</button>
+    </div>`;
+  }).join("");
+}
+
+async function wmOpen(taskId) {
+  const t = state.tasks.get(taskId);
+  if (!t || !t.filename) return toast("找不到文件，可能已被移动", "err");
+  wmS.taskId = taskId;
+  wmS.regions = [];
+  wmS.sel = -1;
+  wmS.drag = null;
+  $("#wmModal").classList.remove("hidden");
+  $("#wmSub").textContent = t.title || "";
+  $("#wmRegions").innerHTML = '<p class="wm-empty">正在加载视频…</p>';
+  const v = $("#wmVideo");
+  v.src = "/api/media?path=" + encodeURIComponent(t.filename);
+  v.onloadedmetadata = () => {
+    wmS.W = v.videoWidth;
+    wmS.H = v.videoHeight;
+    setTimeout(() => { wmSyncCanvas(); wmRender(); wmList(); }, 60);
+  };
+  const st = await api("/api/ai/status");
+  wmS.aiReady = !!st.ready;
+  $("#wmAiState").textContent = st.ready ? "AI 引擎已就绪" : (st.error || "AI 引擎未就绪");
+  $("#wmAiSetup").classList.toggle("hidden", !!st.ready);
+  $("#wmAiRow").classList.toggle("hidden", $("#wmEngine").value !== "ai");
+}
+
+function wmClose() {
+  $("#wmModal").classList.add("hidden");
+  const v = $("#wmVideo");
+  try { v.pause(); } catch (e) {}
+  v.removeAttribute("src");
+}
+
+/* 画布交互 */
+(function wmBind() {
+  const c = $("#wmCanvas");
+  if (!c) return;
+  const rel = (e) => {
+    const r = c.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+  };
+
+  c.addEventListener("mousedown", (e) => {
+    if (!wmS.cw) return;
+    const p = rel(e);
+    const t = $("#wmVideo").currentTime || 0;
+    let hit = -1;
+    wmS.regions.forEach((rg, i) => {
+      const q = wmPosAt(rg, t);
+      if (p.x >= q.x && p.x <= q.x + rg.w && p.y >= q.y && p.y <= q.y + rg.h) hit = i;
+    });
+    if (hit >= 0) {
+      wmS.sel = hit;
+      const rg = wmS.regions[hit], q = wmPosAt(rg, t);
+      wmS.drag = { mode: "move", i: hit, ox: p.x - q.x, oy: p.y - q.y, w0: rg.w, h0: rg.h,
+                   cur: { x: q.x, y: q.y } };
+      wmList(); wmRender();
+      return;
+    }
+    wmS.drag = { mode: "new", x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+    wmRender();
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!wmS.drag) return;
+    const p = rel(e);
+    if (wmS.drag.mode === "new") {
+      wmS.drag.x1 = Math.max(0, Math.min(1, p.x));
+      wmS.drag.y1 = Math.max(0, Math.min(1, p.y));
+    } else {
+      const d = wmS.drag;
+      d.cur = {
+        x: Math.max(0, Math.min(1 - d.w0, p.x - d.ox)),
+        y: Math.max(0, Math.min(1 - d.h0, p.y - d.oy)),
+      };
+    }
+    wmRender();
+  });
+
+  window.addEventListener("mouseup", () => {
+    const d = wmS.drag;
+    if (!d) return;
+    wmS.drag = null;
+    if (d.mode === "new") {
+      const x = Math.min(d.x0, d.x1), y = Math.min(d.y0, d.y1);
+      const w = Math.abs(d.x1 - d.x0), h = Math.abs(d.y1 - d.y0);
+      if (w > 0.008 && h > 0.008) {
+        wmS.regions.push({ x, y, w, h, track: [] });
+        wmS.sel = wmS.regions.length - 1;
+        wmList();
+      }
+    } else {
+      const rg = wmS.regions[d.i];
+      if (rg) {
+        rg.x = d.cur.x;
+        rg.y = d.cur.y;
+        // 已有多点轨迹时，同步移动当前时刻对应的点
+        const t = $("#wmVideo").currentTime || 0;
+        if ((rg.track || []).length > 1) {
+          let best = -1, bd = 1e9;
+          rg.track.forEach((k, i) => {
+            const dd = Math.abs(k.t - t);
+            if (dd < bd) { bd = dd; best = i; }
+          });
+          if (best >= 0 && bd < 0.35) {
+            rg.track[best].x = d.cur.x;
+            rg.track[best].y = d.cur.y;
+          }
+        }
+        wmList();
+      }
+    }
+    wmRender();
+  });
+
+  $("#wmRegions").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-del]");
+    if (del) {
+      wmS.regions.splice(+del.dataset.del, 1);
+      wmS.sel = Math.min(wmS.sel, wmS.regions.length - 1);
+      wmList(); wmRender();
+      return;
+    }
+    const row = e.target.closest(".wm-reg");
+    if (row) { wmS.sel = +row.dataset.i; wmList(); wmRender(); }
+  });
+
+  $("#wmVideo").addEventListener("timeupdate", wmRender);
+  $("#wmVideo").addEventListener("seeked", wmRender);
+  window.addEventListener("resize", () => { if (!$("#wmModal").classList.contains("hidden")) { wmSyncCanvas(); wmRender(); } });
+})();
+
+/* 轨迹点记录（按钮动态插入到区域列表上方） */
+async function wmAddTrack() {
+  if (wmS.sel < 0) return toast("先点选一个区域", "warn");
+  const r = wmS.regions[wmS.sel];
+  const t = +($("#wmVideo").currentTime || 0).toFixed(2);
+  const p = wmPosAt(r, t);
+  r.track = (r.track || []).filter((k) => Math.abs(k.t - t) > 0.05);
+  r.track.push({ t, x: p.x, y: p.y });
+  r.track.sort((a, b) => a.t - b.t);
+  wmList(); wmRender();
+  toast(`已记录轨迹点 t=${t}s（共 ${r.track.length} 个）`, "ok");
+}
+
+async function wmDetect() {
+  const btn = $("#wmDetect");
+  btn.disabled = true;
+  btn.textContent = "检测中…";
+  try {
+    const r = await api("/api/wm/detect", { id: wmS.taskId });
+    if (!r.ok) return toast(r.error || "检测失败", "err");
+    const regs = r.regions || [];
+    if (!regs.length) return toast("没找到明显的水印区域，请手动框选", "warn");
+    regs.forEach((g) => wmS.regions.push({ x: g.x, y: g.y, w: g.w, h: g.h, track: [] }));
+    wmList(); wmRender();
+    toast(`检测到 ${regs.length} 个候选区域，多余的可以删掉`, "ok");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "自动检测";
+  }
+}
+
+async function wmRun() {
+  if (!wmS.regions.length) return toast("请先框选水印区域", "warn");
+  const engine = $("#wmEngine").value;
+  if (engine === "ai" && !wmS.aiReady) return toast("AI 引擎未就绪，先点「下载引擎」", "warn");
+  const payload = {
+    id: wmS.taskId,
+    watermark: {
+      enabled: true,
+      engine,
+      regions: wmS.regions.map((r) => ({
+        x: r.x, y: r.y, w: r.w, h: r.h,
+        track: (r.track || []).length > 1 ? r.track : [],
+      })),
+    },
+  };
+  const r = await api("/api/wm/apply", payload);
+  if (r.ok) {
+    toast("已开始去水印处理，进度看任务列表", "ok", 4000);
+    wmClose();
+  } else {
+    toast(r.error || "提交失败", "err");
+  }
+}
+
+$("#wmClose")?.addEventListener("click", wmClose);
+$("#wmDetect")?.addEventListener("click", wmDetect);
+$("#wmRun")?.addEventListener("click", wmRun);
+$("#wmEngine")?.addEventListener("change", (e) => {
+  $("#wmAiRow").classList.toggle("hidden", e.target.value !== "ai");
+  $("#wmNote").textContent = e.target.value === "ai"
+    ? "AI 修补：CPU 上较慢（每帧约 2-3 秒），适合半透明小面积水印"
+    : "静态水印几秒到一两分钟；移动水印需要逐帧处理，稍慢";
+});
+$("#wmAiSetup")?.addEventListener("click", async () => {
+  const b = $("#wmAiSetup");
+  b.disabled = true;
+  b.textContent = "下载中…";
+  const r = await api("/api/ai/setup", {});
+  b.disabled = false;
+  b.textContent = "下载引擎";
+  toast(r.message || (r.ok ? "完成" : "失败"), r.ok ? "ok" : "err", 5000);
+  if (r.ok) {
+    wmS.aiReady = true;
+    $("#wmAiState").textContent = "AI 引擎已就绪";
+    b.classList.add("hidden");
+  }
+});
+
+$("#wmTrack")?.addEventListener("click", wmAddTrack);
+
+/* 支持 #wm=<taskId> 直接打开编辑器 */
+(function wmHash(){
+  const m = location.hash.match(/^#wm=(.+)$/);
+  if (m) setTimeout(() => { if (state.tasks.has(m[1])) wmOpen(m[1]); }, 900);
+})();
+
+/* Delete 删除选中区域 */
+window.addEventListener("keydown", (e) => {
+  if ($("#wmModal").classList.contains("hidden")) return;
+  if ((e.key === "Delete" || e.key === "Backspace") && wmS.sel >= 0) {
+    e.preventDefault();
+    wmS.regions.splice(wmS.sel, 1);
+    wmS.sel = Math.min(wmS.sel, wmS.regions.length - 1);
+    wmList(); wmRender();
+  }
+  if (e.key === "Escape") wmClose();
+});

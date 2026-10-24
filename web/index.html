@@ -275,6 +275,60 @@
 </main>
 
 <div class="toasts" id="toasts"></div>
+
+<!-- ==================== 去水印编辑器 ==================== -->
+<div class="modal hidden" id="wmModal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <div>
+        <h3>去水印编辑器</h3>
+        <p class="modal-sub" id="wmSub">在画面上拖拽框选水印区域，可框多个</p>
+      </div>
+      <button class="icon-btn" id="wmClose" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="wm-stage-wrap">
+        <div class="wm-stage" id="wmStage">
+          <video id="wmVideo" controls playsinline preload="metadata"></video>
+          <canvas id="wmCanvas"></canvas>
+        </div>
+        <div class="wm-hint">
+          <span>拖拽画框 · 点框选中 · <b>Delete</b> 删除</span>
+          <span id="wmTime">0.0s</span>
+        </div>
+      </div>
+
+      <aside class="wm-side">
+        <div class="wm-side-head">
+          <span class="sec-title">水印区域 <b id="wmCount">0</b></span>
+          <button class="btn btn-soft sm" id="wmDetect">自动检测</button>
+        </div>
+        <div class="wm-regions" id="wmRegions">
+          <p class="wm-empty">还没有区域，在左侧画面上拖拽框选</p>
+        </div>
+        <div class="wm-track-row">
+          <button class="btn btn-soft sm" id="wmTrack">＋ 记录轨迹点（移动水印）</button>
+        </div>
+
+        <div class="field mt10">
+          <label class="lab">修补引擎</label>
+          <select id="wmEngine" class="input">
+            <option value="fast">轻量修补（快，推荐）</option>
+            <option value="ai">AI 修补（慢，实验性）</option>
+          </select>
+        </div>
+        <div class="wm-ai-row hidden" id="wmAiRow">
+          <span id="wmAiState">AI 引擎未就绪</span>
+          <button class="btn btn-soft sm" id="wmAiSetup">下载引擎</button>
+        </div>
+        <p class="sec-note" id="wmNote">静态水印几秒到一两分钟；移动水印需要逐帧处理，稍慢</p>
+
+        <button class="btn btn-primary wm-run" id="wmRun">开始处理</button>
+      </aside>
+    </div>
+  </div>
+</div>
+
 <script src="app.js"></script>
 </body>
 </html>

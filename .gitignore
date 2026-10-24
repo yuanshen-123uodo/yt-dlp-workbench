@@ -24,3 +24,7 @@ dist/
 build/
 *.spec
 icon_preview.png
+
+# ---- AI 模型（运行时下载，200MB+ 不进仓库） ----
+ai/
+*.onnx
