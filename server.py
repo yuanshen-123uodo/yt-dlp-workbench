@@ -154,17 +154,66 @@ def save_config():
 
 
 def find_ffmpeg():
-    p = shutil.which("ffmpeg")
-    if p:
-        return p
+    """优先用 exe 同级 bin/ffmpeg.exe（exe 版首次运行会从内置资源解压过来），
+    其次系统 PATH 里的 ffmpeg。"""
     local = os.path.join(BASE_DIR, "bin", "ffmpeg.exe")
     if os.path.exists(local):
         return local
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
     return None
 
 
 FFMPEG = find_ffmpeg()
 FFPROBE = None
+
+
+def _bundled_ffmpeg():
+    """在 PyInstaller 打包资源里找内置的 ffmpeg.exe。"""
+    p = os.path.join(RES_DIR, "bin", "ffmpeg.exe")
+    if os.path.isfile(p):
+        return p
+    p = os.path.join(RES_DIR, "ffmpeg.exe")
+    if os.path.isfile(p):
+        return p
+    # 兼容 --add-binary 保留原文件名的情况（如 ffmpeg-win-x86_64-v7.1.exe）
+    try:
+        for n in sorted(os.listdir(os.path.join(RES_DIR, "bin"))):
+            if n.lower().startswith("ffmpeg") and n.lower().endswith(".exe"):
+                return os.path.join(RES_DIR, "bin", n)
+    except Exception:
+        pass
+    return None
+
+
+def ensure_ffmpeg():
+    """确保 ffmpeg 可用（exe 模式首次运行把内置二进制解压到 exe 同级 bin/）。
+    返回是否就绪。"""
+    global FFMPEG, FFPROBE
+    local = os.path.join(APP_DIR, "bin", "ffmpeg.exe")
+    if os.path.isfile(local):
+        FFMPEG = local
+        find_ffprobe()
+        return True
+    if FROZEN:
+        src = _bundled_ffmpeg()
+        if src:
+            try:
+                os.makedirs(os.path.dirname(local), exist_ok=True)
+                shutil.copyfile(src, local)
+                FFMPEG = local
+            except Exception:
+                FFMPEG = src  # 磁盘只读等场景：直接调用打包资源里的
+            find_ffprobe()
+            return True
+    w = shutil.which("ffmpeg")
+    if w:
+        FFMPEG = w
+        find_ffprobe()
+        return True
+    FFMPEG = None
+    return False
 
 
 def find_ffprobe():
@@ -205,6 +254,11 @@ def child_env():
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env.pop("PYTHONHOME", None)
+    # 让 yt-dlp 子进程也能通过 PATH 找到 ffmpeg（--ffmpeg-location 之外的双保险）
+    if FFMPEG:
+        d = os.path.dirname(FFMPEG)
+        if d and d not in env.get("PATH", ""):
+            env["PATH"] = d + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -380,22 +434,40 @@ WM_SIZE = {"s": (0.16, 0.07), "m": (0.22, 0.10), "l": (0.30, 0.14)}
 
 
 def probe_video(path):
-    if not FFPROBE:
+    """读取视频宽高与时长。优先 ffprobe；没有则用 ffmpeg 解析 stderr 回退。"""
+    if FFPROBE:
+        try:
+            r = subprocess.run(
+                [FFPROBE, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-show_entries", "format=duration",
+                 "-of", "json", path],
+                capture_output=True, timeout=60, creationflags=CREATE_NO_WINDOW,
+            )
+            d = json.loads((r.stdout or b"{}").decode("utf-8", "replace"))
+            st = (d.get("streams") or [{}])[0]
+            w, h = int(st.get("width") or 0), int(st.get("height") or 0)
+            dur = float((d.get("format") or {}).get("duration") or 0)
+            if w and h:
+                return {"w": w, "h": h, "duration": dur}
+        except Exception:
+            pass
+    # 回退：ffmpeg -i 的 stderr 里就有分辨率和时长
+    if not FFMPEG:
         return None
     try:
         r = subprocess.run(
-            [FFPROBE, "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-show_entries", "format=duration",
-             "-of", "json", path],
+            [FFMPEG, "-hide_banner", "-i", path],
             capture_output=True, timeout=60, creationflags=CREATE_NO_WINDOW,
         )
-        d = json.loads((r.stdout or b"{}").decode("utf-8", "replace"))
-        st = (d.get("streams") or [{}])[0]
-        return {
-            "w": int(st.get("width") or 0),
-            "h": int(st.get("height") or 0),
-            "duration": float((d.get("format") or {}).get("duration") or 0),
-        }
+        err = (r.stderr or b"").decode("utf-8", "replace")
+        m = re.search(r"Stream #\d+:\d+.*?: Video:.*?,\s*(\d{2,5})x(\d{2,5})", err)
+        if not m:
+            return None
+        dur = 0.0
+        dm = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", err)
+        if dm:
+            dur = int(dm.group(1)) * 3600 + int(dm.group(2)) * 60 + float(dm.group(3))
+        return {"w": int(m.group(1)), "h": int(m.group(2)), "duration": dur}
     except Exception:
         return None
 
@@ -438,25 +510,43 @@ STREAM_TYPES = ("video", "audio", "subtitle", "data", "attachment")
 
 
 def probe_streams(path):
-    """返回 [(type, codec), …]，失败返回 None。"""
-    if not FFPROBE:
+    """返回 [(type, codec), …]，失败返回 None。优先 ffprobe，没有则用 ffmpeg 解析。"""
+    if FFPROBE:
+        try:
+            r = subprocess.run(
+                [FFPROBE, "-v", "error", "-show_entries", "stream=codec_type,codec_name",
+                 "-of", "csv=p=0", path],
+                capture_output=True, timeout=60, creationflags=CREATE_NO_WINDOW,
+            )
+            out = []
+            for line in (r.stdout or b"").decode("utf-8", "replace").splitlines():
+                parts = [p.strip() for p in line.split(",") if p.strip()]
+                if not parts:
+                    continue
+                # ffprobe 的 CSV 列序并不固定（实测为 codec_name,codec_type），按值判断
+                kind = next((p for p in parts if p in STREAM_TYPES), "")
+                codec = next((p for p in parts if p not in STREAM_TYPES), "")
+                if kind:
+                    out.append((kind, codec))
+            if out:
+                return out
+        except Exception:
+            pass
+    # 回退：ffmpeg -i 的 stderr 里就有流类型和编码
+    if not FFMPEG:
         return None
     try:
         r = subprocess.run(
-            [FFPROBE, "-v", "error", "-show_entries", "stream=codec_type,codec_name",
-             "-of", "csv=p=0", path],
+            [FFMPEG, "-hide_banner", "-i", path],
             capture_output=True, timeout=60, creationflags=CREATE_NO_WINDOW,
         )
+        err = (r.stderr or b"").decode("utf-8", "replace")
         out = []
-        for line in (r.stdout or b"").decode("utf-8", "replace").splitlines():
-            parts = [p.strip() for p in line.split(",") if p.strip()]
-            if not parts:
-                continue
-            # ffprobe 的 CSV 列序并不固定（实测为 codec_name,codec_type），按值判断
-            kind = next((p for p in parts if p in STREAM_TYPES), "")
-            codec = next((p for p in parts if p not in STREAM_TYPES), "")
-            if kind:
-                out.append((kind, codec))
+        for m in re.finditer(
+                r"Stream #\d+:\d+(?:\([^)]*\))?[^:]*:\s*(Video|Audio|Subtitle|Data)\s*:\s*([A-Za-z0-9]+)", err):
+            kind = m.group(1).lower()
+            if kind in STREAM_TYPES:
+                out.append((kind, m.group(2)))
         return out or None
     except Exception:
         return None
@@ -556,8 +646,8 @@ def apply_watermark(task):
     if not path or not os.path.isfile(path):
         add_log("去水印跳过：找不到源文件", tid, "warn")
         return False
-    if not FFMPEG or not FFPROBE:
-        add_log("去水印跳过：缺少 ffmpeg/ffprobe", tid, "warn")
+    if not FFMPEG:
+        add_log("去水印跳过：缺少 ffmpeg", tid, "warn")
         return False
 
     info = probe_video(path)
@@ -1427,6 +1517,10 @@ def main():
             input("按回车退出…")
             return
     detect_version()
+    ff_ok = ensure_ffmpeg()
+    if not ff_ok:
+        print("!! 未找到 ffmpeg（高清合并 / 双轨拆分 / 去水印需要它）")
+        print("   本 exe 已内置 ffmpeg，若此提示仍出现，请检查 bin 目录写入权限")
     running = existing_instance()
     if running:
         url = "http://127.0.0.1:%d" % running

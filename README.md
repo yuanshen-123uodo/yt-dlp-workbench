@@ -22,9 +22,9 @@
 
 ### Windows 用户（推荐，零依赖）
 
-到 [Releases](https://github.com/yuanshen-123uodo/yt-dlp-workbench/releases/latest) 页面下载 **`yt-dlp-workbench.exe`**（约 9MB），双击即用：
+到 [Releases](https://github.com/yuanshen-123uodo/yt-dlp-workbench/releases/latest) 页面下载 **`yt-dlp-workbench.exe`**（约 40MB），双击即用：
 
-- **无需安装 Python**，也无需装任何第三方库
+- **无需安装 Python、ffmpeg 或任何其他组件** —— ffmpeg 已内置，首次运行自动就位
 - 首次运行会自动下载 yt-dlp（约 18MB，一次性；之后启动只要 2–3 秒）
 - 下载的文件保存在 exe 同目录的 `downloads\` 文件夹
 - 用完关掉黑色命令行窗口即可停止服务
@@ -49,7 +49,7 @@ python server.py
 |---|---|---|
 | Python 3.8+ | 源码运行必需 | 只用标准库，不用 pip 装任何东西；**exe 版不需要** |
 | yt-dlp | 必需 | 首次运行自动下载；或 [ releases 页面 ](https://github.com/yt-dlp/yt-dlp/releases/latest) 手动放到 `bin/`；或 `pip install yt-dlp` / `winget install yt-dlp` |
-| ffmpeg | 强烈推荐 | 高清视频合并音视频、双轨拆分、去水印都靠它。[下载](https://ffmpeg.org/download.html) 后加入 PATH 即可 |
+| ffmpeg | 强烈推荐（源码运行） | 高清视频合并音视频、双轨拆分、去水印都靠它。[下载](https://ffmpeg.org/download.html) 后加入 PATH 即可；**exe 版已内置，无需安装** |
 
 > 1080P 以上或会员内容：在「高级选项 → Cookie 来源」选一个已登录该网站的浏览器。
 > YouTube 等站点打不开：在「高级选项 → 代理」填本地代理，如 `http://127.0.0.1:7890`。
@@ -71,7 +71,7 @@ python server.py
 ## 常见问题
 
 - **提示找不到 yt-dlp**：确认 `bin/yt-dlp.exe` 存在，或系统 PATH 里有 yt-dlp
-- **提示 ffmpeg 缺失**：装一个加入 PATH（Windows 可 `winget install Gyan.FFmpeg`）
+- **提示 ffmpeg 缺失**（仅源码运行）：装一个加入 PATH（Windows 可 `winget install Gyan.FFmpeg`）；exe 版已内置 ffmpeg，不会出现此提示
 - **下载失败**：先点页面右上角「更新」升级 yt-dlp，站点改版后旧版本常失效
 - **页面打不开**：确认是通过 bat 启动的，且黑色窗口没关
 
@@ -82,3 +82,8 @@ python server.py
 ## License
 
 [MIT](LICENSE) © 2026 yuanshen-123uodo
+
+## 第三方组件
+
+- 本仓库源码采用 [MIT](LICENSE) 许可证
+- exe 发布版内置 [FFmpeg](https://ffmpeg.org/)（v7.1 essentials 构建，来自 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)），FFmpeg 二进制遵循其自身的 GPL/LGPL 许可条款；对应版本的源码可在 FFmpeg 官方发布渠道获取
