@@ -1,0 +1,20 @@
+# ---- 运行时数据（本地生成，不进仓库） ----
+config.json
+history.json
+archive.txt
+downloads/
+bin/
+__pycache__/
+*.pyc
+
+# ---- yt-dlp / ffmpeg 临时文件 ----
+*.part
+*.ytdl
+*.temp
+.__track*
+.__wm*
+
+# ---- 系统垃圾 ----
+Thumbs.db
+desktop.ini
+.DS_Store

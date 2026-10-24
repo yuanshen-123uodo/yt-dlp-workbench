@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>yt-dlp 工作台</title>
+<link rel="stylesheet" href="style.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>▶</text></svg>" />
+</head>
+<body>
+<div class="bg-glow"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">
+      <svg viewBox="0 0 24 24" width="19" height="19" fill="none"><path d="M8 5.5v13l11-6.5-11-6.5Z" fill="currentColor"/></svg>
+    </div>
+    <div class="brand-text">
+      <h1>yt-dlp 工作台</h1>
+      <p>视频 / 音频下载可视化控制台</p>
+    </div>
+  </div>
+
+  <div class="top-chips">
+    <span class="chip" id="chipVer"><i class="dot"></i>yt-dlp</span>
+    <span class="chip" id="chipFfmpeg"><i class="dot"></i>ffmpeg</span>
+    <span class="chip chip-soft" id="chipDir" title="点击打开下载目录">—</span>
+  </div>
+
+  <div class="top-actions">
+    <button class="btn btn-ghost" id="btnUpdate">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v4h-4"/></svg>
+      更新
+    </button>
+    <button class="btn btn-ghost" id="btnOpenDir">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h9A1.5 1.5 0 0 1 21 10v8.5A1.5 1.5 0 0 1 19.5 20h-15A1.5 1.5 0 0 1 3 18.5v-11Z"/></svg>
+      打开目录
+    </button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ==================== 左侧控制区 ==================== -->
+  <aside class="panel side">
+    <div class="side-scroll">
+
+      <section class="sec">
+        <div class="sec-head">
+          <span class="sec-title">下载链接</span>
+          <span class="sec-hint">每行一个，支持批量</span>
+        </div>
+        <textarea id="urls" class="input area" spellcheck="false"
+          placeholder="粘贴视频 / 播放列表 / 频道链接…&#10;https://www.youtube.com/watch?v=…&#10;https://www.bilibili.com/video/BV…"></textarea>
+        <div class="row gap">
+          <button class="btn btn-soft flex1" id="btnPaste">粘贴</button>
+          <button class="btn btn-soft flex1" id="btnClearUrls">清空</button>
+          <button class="btn btn-soft flex1" id="btnParse">解析信息</button>
+        </div>
+        <div id="preview" class="preview hidden"></div>
+      </section>
+
+      <div class="path-row">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" style="flex:none;color:#63758c"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h9A1.5 1.5 0 0 1 21 10v8.5A1.5 1.5 0 0 1 19.5 20h-15A1.5 1.5 0 0 1 3 18.5v-11Z"/></svg>
+        <input id="outdir" class="input flex1 mono" spellcheck="false" title="保存位置" />
+        <button class="btn btn-soft sm" id="btnPick">选择</button>
+      </div>
+
+      <section class="sec">
+        <div class="sec-head"><span class="sec-title">画质与格式</span></div>
+        <div class="presets" id="presets">
+          <button class="preset active" data-preset="best">
+            <span class="p-ico">★</span>
+            <span class="p-name">最佳画质</span>
+            <span class="p-desc">自动选最高并合并</span>
+          </button>
+          <button class="preset" data-preset="2160">
+            <span class="p-ico">4K</span>
+            <span class="p-name">2160P</span>
+            <span class="p-desc">超高清</span>
+          </button>
+          <button class="preset" data-preset="1080">
+            <span class="p-ico">HD</span>
+            <span class="p-name">1080P</span>
+            <span class="p-desc">主流高清</span>
+          </button>
+          <button class="preset" data-preset="720">
+            <span class="p-ico">SD</span>
+            <span class="p-name">720P</span>
+            <span class="p-desc">省空间</span>
+          </button>
+          <button class="preset" data-preset="audio-mp3">
+            <span class="p-ico">♪</span>
+            <span class="p-name">仅音频 MP3</span>
+            <span class="p-desc">转码 320kbps</span>
+          </button>
+          <button class="preset" data-preset="audio-m4a">
+            <span class="p-ico">♫</span>
+            <span class="p-name">仅音频 M4A</span>
+            <span class="p-desc">无损封装不转码</span>
+          </button>
+        </div>
+        <div class="field mt8">
+          <label class="lab">自定义格式表达式 <span class="tip" title="yt-dlp -f 语法，例如 bv*[height<=1440]+ba">?</span></label>
+          <input id="customFormat" class="input" spellcheck="false" placeholder="bv*[height<=1440]+ba/b   （留空则按上面预设）" />
+        </div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-head"><span class="sec-title">输出与后期</span></div>
+        <div class="seg" id="modeSeg">
+          <button class="seg-btn active" data-mode="merge">成片合并</button>
+          <button class="seg-btn" data-mode="split">剪辑双轨</button>
+        </div>
+        <p class="sec-note" id="modeHint">音视频合成一个文件，直接能看</p>
+
+        <div class="field mt10 hidden" id="audioFmtWrap">
+          <label class="lab">音频轨格式</label>
+          <select id="audioFmt" class="input">
+            <option value="orig">原始格式（不转码，最快）</option>
+            <option value="wav">WAV（剪辑软件最稳）</option>
+            <option value="mp3">MP3</option>
+          </select>
+        </div>
+
+        <button class="wm-btn" id="btnWm">
+          <span class="wm-ico">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 20 20 4M8.5 4.5 5 8a4.2 4.2 0 0 0 6 6l3.5-3.5"/><path d="m14 9 3 3"/>
+            </svg>
+          </span>
+          <span class="wm-txt"><b>去水印</b><i id="wmState">未开启</i></span>
+          <span class="wm-switch"><i></i></span>
+        </button>
+
+        <div class="wm-opts hidden" id="wmOpts">
+          <div class="grid2">
+            <div class="field">
+              <label class="lab">处理方式</label>
+              <select id="wmMode" class="input">
+                <option value="delogo">区域消除（推荐）</option>
+                <option value="crop">裁掉边条</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="lab">水印位置</label>
+              <select id="wmPos" class="input">
+                <option value="tr">右上角</option>
+                <option value="br">右下角</option>
+                <option value="tl">左上角</option>
+                <option value="bl">左下角</option>
+              </select>
+            </div>
+          </div>
+          <div class="wm-size-row">
+            <label class="lab">区域大小</label>
+            <div class="seg small" id="wmSize">
+              <button class="seg-btn" data-size="s">小</button>
+              <button class="seg-btn active" data-size="m">中</button>
+              <button class="seg-btn" data-size="l">大</button>
+            </div>
+          </div>
+          <p class="sec-note warn">需重编码一次视频（音频不动），3 分钟片子约 1–2 分钟</p>
+        </div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-head">
+          <span class="sec-title">高级选项</span>
+          <button class="link-btn" id="btnToggleAdv">展开</button>
+        </div>
+        <div id="advBody" class="adv collapsed">
+          <div class="toggles">
+            <label class="tg"><input type="checkbox" id="optPlaylist" /><i></i><span>整个播放列表</span></label>
+            <label class="tg"><input type="checkbox" id="optSubs" /><i></i><span>下载字幕</span></label>
+            <label class="tg"><input type="checkbox" id="optAutoSubs" /><i></i><span>自动字幕</span></label>
+            <label class="tg"><input type="checkbox" id="optEmbedSubs" /><i></i><span>字幕嵌入视频</span></label>
+            <label class="tg"><input type="checkbox" id="optEmbedThumb" /><i></i><span>封面嵌入</span></label>
+            <label class="tg"><input type="checkbox" id="optMetadata" /><i></i><span>写入元数据</span></label>
+            <label class="tg"><input type="checkbox" id="optChapters" /><i></i><span>章节标记</span></label>
+            <label class="tg"><input type="checkbox" id="optArchive" /><i></i><span>跳过已下载</span></label>
+          </div>
+
+          <div class="field mt10">
+            <label class="lab">字幕语言</label>
+            <input id="subLangs" class="input mono" value="zh.*,en.*" spellcheck="false" />
+          </div>
+
+          <div class="grid2 mt10">
+            <div class="field">
+              <label class="lab">Cookie 来源</label>
+              <select id="cookies" class="input">
+                <option value="">不使用</option>
+                <option value="chrome">Chrome</option>
+                <option value="edge">Edge</option>
+                <option value="firefox">Firefox</option>
+                <option value="brave">Brave</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="lab">并发片段数</label>
+              <input id="fragments" class="input mono" type="number" min="1" max="16" value="4" />
+            </div>
+          </div>
+
+          <div class="grid2 mt10">
+            <div class="field">
+              <label class="lab">限速</label>
+              <input id="rateLimit" class="input mono" placeholder="如 5M" spellcheck="false" />
+            </div>
+            <div class="field">
+              <label class="lab">代理</label>
+              <input id="proxy" class="input mono" placeholder="http://127.0.0.1:7890" spellcheck="false" />
+            </div>
+          </div>
+          <p class="sec-note mt8">1080P 以上或会员内容需要登录态：Cookie 来源选你已登录的浏览器（Chrome 需先完全退出）。YouTube 打不开就填代理。</p>
+        </div>
+      </section>
+
+      <div class="spacer"></div>
+    </div>
+
+    <div class="side-foot">
+      <button class="btn btn-primary" id="btnStart">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14"/></svg>
+        开始下载
+      </button>
+      <p class="foot-hint"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 快速开始</p>
+    </div>
+  </aside>
+
+  <!-- ==================== 右侧工作区 ==================== -->
+  <section class="panel work">
+    <div class="work-head">
+      <div class="work-title">
+        <h2>任务队列</h2>
+        <div class="stats" id="stats">
+          <span class="st"><b id="stRun">0</b>进行中</span>
+          <span class="st"><b id="stQueue">0</b>排队</span>
+          <span class="st ok"><b id="stDone">0</b>完成</span>
+          <span class="st err"><b id="stErr">0</b>异常</span>
+        </div>
+      </div>
+      <div class="row gap">
+        <button class="btn btn-soft sm" id="btnClearDone">清空已结束</button>
+      </div>
+    </div>
+
+    <div class="tasks" id="tasks">
+      <div class="empty" id="emptyState">
+        <svg viewBox="0 0 120 100" width="132" height="110" fill="none">
+          <rect x="16" y="26" width="88" height="58" rx="10" stroke="currentColor" stroke-opacity=".22" stroke-width="1.6" stroke-dasharray="5 5"/>
+          <path d="M60 44v20m0 0 8-8m-8 8-8-8" stroke="currentColor" stroke-opacity=".45" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="60" cy="20" r="4" fill="currentColor" fill-opacity=".3"/>
+        </svg>
+        <p class="empty-t">队列还是空的</p>
+        <p class="empty-s">在左侧粘贴链接，选好画质，点「开始下载」</p>
+      </div>
+    </div>
+
+    <div class="console">
+      <div class="console-head">
+        <div class="tabs">
+          <button class="tab active" data-tab="log">运行日志</button>
+          <button class="tab" data-tab="history">下载历史</button>
+        </div>
+        <div class="row gap">
+          <label class="mini-tg"><input type="checkbox" id="autoScroll" checked /><span>自动滚动</span></label>
+          <button class="link-btn" id="btnClearLog">清空</button>
+        </div>
+      </div>
+      <div class="console-body" id="logBody"></div>
+      <div class="console-body hidden" id="historyBody"></div>
+    </div>
+  </section>
+</main>
+
+<div class="toasts" id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>
