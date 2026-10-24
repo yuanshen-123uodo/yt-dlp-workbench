@@ -18,3 +18,9 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---- 打包产物 ----
+dist/
+build/
+*.spec
+icon_preview.png

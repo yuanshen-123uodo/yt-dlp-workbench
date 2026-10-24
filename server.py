@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 yt-dlp 可视化工作台 - 本地服务
-仅依赖 Python 标准库，双击 启动工作台.bat 即可使用。
+仅依赖 Python 标准库，双击 启动工作台.bat 即可使用；也可直接用打包好的 exe。
 """
 import json
 import os
@@ -16,10 +16,30 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-WEB_DIR = os.path.join(BASE_DIR, "web")
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-HISTORY_PATH = os.path.join(BASE_DIR, "history.json")
+FROZEN = getattr(sys, "frozen", False)
+
+
+def _app_dir():
+    """可写数据目录：exe 所在目录（打包后）或脚本所在目录（源码运行）。
+    config / history / downloads / bin / archive 都在这里。"""
+    if FROZEN:
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resource_dir():
+    """只读资源目录：打包后是 PyInstaller 临时解压目录，web/ 静态文件在里面。"""
+    if FROZEN:
+        return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = _app_dir()
+RES_DIR = _resource_dir()
+BASE_DIR = APP_DIR  # 兼容引用：一律按「可写数据目录」语义
+WEB_DIR = os.path.join(RES_DIR, "web")
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+HISTORY_PATH = os.path.join(APP_DIR, "history.json")
 
 
 def find_ytdlp():
@@ -34,6 +54,62 @@ def find_ytdlp():
 
 
 BIN = find_ytdlp()
+
+YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+
+
+def ensure_ytdlp():
+    """把 yt-dlp.exe 下载到 bin/ 目录（exe 版首次运行用）。
+    多重回退适配不同网络 / 证书环境，任一成功即返回 True。"""
+    local = os.path.join(APP_DIR, "bin", "yt-dlp.exe")
+    tmp = local + ".part"
+    try:
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+    except Exception:
+        pass
+
+    def ok():
+        return os.path.exists(tmp) and os.path.getsize(tmp) > 1024 * 1024
+
+    attempts = []
+    if os.name == "nt":
+        # 优先系统自带 curl（走 schannel，信任 Windows 证书存储，能过本地安全软件的 TLS 扫描）
+        attempts.append(["curl", "-fL", "-o", tmp, YTDLP_URL])
+        attempts.append(["curl", "-fL", "--ssl-no-revoke", "-o", tmp, YTDLP_URL])
+        attempts.append(["powershell", "-NoProfile", "-Command",
+                         "$ProgressPreference='SilentlyContinue'; try{Invoke-WebRequest '%s' -OutFile '%s'}catch{exit 1}" % (YTDLP_URL, tmp)])
+    for cmd in attempts:
+        try:
+            subprocess.run(cmd, timeout=180, creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            continue
+        if ok():
+            break
+    else:
+        # 通用回退：Python urllib（先尝试验证证书，失败则跳过验证——本地自用工具可接受）
+        import urllib.request
+        import ssl
+        try:
+            urllib.request.urlretrieve(YTDLP_URL, tmp)
+        except Exception:
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(YTDLP_URL, timeout=180, context=ctx) as r:
+                    with open(tmp, "wb") as f:
+                        shutil.copyfileobj(r, f)
+            except Exception:
+                pass
+    if ok():
+        os.replace(tmp, local)
+        return True
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except Exception:
+        pass
+    return False
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
@@ -1327,14 +1403,29 @@ def existing_instance(start=8765):
 
 
 def main():
+    global BIN
     if not os.path.exists(BIN):
-        print("!! 未找到 yt-dlp 可执行文件")
-        print("   请任选一种方式：")
-        print("   1. 下载 yt-dlp.exe 放到 bin\\ 目录：")
-        print("      https://github.com/yt-dlp/yt-dlp/releases/latest")
-        print("   2. 或安装 yt-dlp 并加入 PATH（pip install yt-dlp / winget install yt-dlp）")
-        input("按回车退出…")
-        return
+        if FROZEN:
+            # exe 版：没有 bin/yt-dlp.exe 时自动下载（PATH 上也没有才会走到这）
+            print("首次运行：正在获取 yt-dlp（约 15MB，只需这一次）...")
+            if ensure_ytdlp():
+                BIN = find_ytdlp()
+                print("yt-dlp 已就绪。")
+            else:
+                print("!! yt-dlp 自动下载失败（网络问题？）")
+                print("   请手动下载后放到本程序同目录的 bin\\ 中：")
+                print("   https://github.com/yt-dlp/yt-dlp/releases/latest")
+                print("   或安装 yt-dlp 并加入 PATH，重新运行本程序")
+                input("按回车退出…")
+                return
+        else:
+            print("!! 未找到 yt-dlp 可执行文件")
+            print("   请任选一种方式：")
+            print("   1. 下载 yt-dlp.exe 放到 bin\\ 目录：")
+            print("      https://github.com/yt-dlp/yt-dlp/releases/latest")
+            print("   2. 或安装 yt-dlp 并加入 PATH（pip install yt-dlp / winget install yt-dlp）")
+            input("按回车退出…")
+            return
     detect_version()
     running = existing_instance()
     if running:

@@ -2,7 +2,7 @@
 
 > 把命令行的 yt-dlp 包成一个**本地网页控制台** —— 双击即用，不用记参数。
 
-一个纯本地的视频 / 音频下载工具：左侧粘贴链接、选画质，右侧看实时进度。支持批量、播放列表、剪辑双轨拆分、去水印。基于 Python 标准库实现，**无需安装任何第三方包**。
+一个纯本地的视频 / 音频下载工具：左侧粘贴链接、选画质，右侧看实时进度。支持批量、播放列表、剪辑双轨拆分、去水印。基于 Python 标准库实现，**无需安装任何第三方包**；也提供打包好的单文件 exe，下载双击即用。
 
 ## 功能特性
 
@@ -20,7 +20,16 @@
 
 ## 快速开始
 
-### Windows（推荐）
+### Windows 用户（推荐，零依赖）
+
+到 [Releases](https://github.com/yuanshen-123uodo/yt-dlp-workbench/releases/latest) 页面下载 **`yt-dlp-workbench.exe`**（约 9MB），双击即用：
+
+- **无需安装 Python**，也无需装任何第三方库
+- 首次运行会自动下载 yt-dlp（约 18MB，一次性；之后启动只要 2–3 秒）
+- 下载的文件保存在 exe 同目录的 `downloads\` 文件夹
+- 用完关掉黑色命令行窗口即可停止服务
+
+### 源码运行（Windows 双击 / 其他平台）
 
 双击 **`启动工作台.bat`**，浏览器会自动打开 http://127.0.0.1:8765 。
 
@@ -38,7 +47,7 @@ python server.py
 
 | 依赖 | 是否必需 | 说明 |
 |---|---|---|
-| Python 3.8+ | 必需 | 只用标准库，不用 pip 装任何东西 |
+| Python 3.8+ | 源码运行必需 | 只用标准库，不用 pip 装任何东西；**exe 版不需要** |
 | yt-dlp | 必需 | 首次运行自动下载；或 [ releases 页面 ](https://github.com/yt-dlp/yt-dlp/releases/latest) 手动放到 `bin/`；或 `pip install yt-dlp` / `winget install yt-dlp` |
 | ffmpeg | 强烈推荐 | 高清视频合并音视频、双轨拆分、去水印都靠它。[下载](https://ffmpeg.org/download.html) 后加入 PATH 即可 |
 
