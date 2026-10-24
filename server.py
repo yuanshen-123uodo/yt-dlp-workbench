@@ -158,6 +158,63 @@ def save_config():
         write_json(CONFIG_PATH, config)
 
 
+def apply_real_path(task):
+    """从 --print-to-file 的输出读真实文件路径（UTF-8），
+    修正因管道编码（cp936）丢失 emoji 等字符的 filename。"""
+    pf = task.get("_path_file") or ""
+    if not pf:
+        return
+    try:
+        if not os.path.isfile(pf):
+            return
+        with open(pf, "r", encoding="utf-8", errors="replace") as f:
+            lines = [l.strip() for l in f if l.strip()]
+        if lines:
+            real = lines[-1]
+            if os.path.isfile(real):
+                with task_lock:
+                    task["filename"] = real
+                    if task.get("title_auto"):
+                        task["title"] = clean_title(os.path.basename(real))
+        try:
+            os.remove(pf)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def resolve_existing(path):
+    """把任务里记录的路径解析成磁盘上真实存在的文件。
+
+    yt-dlp 输出到管道时用系统编码（中文 Windows 是 cp936），
+    emoji 等字符会被丢掉，导致记录的文件名和真实文件对不上。
+    这里做一次「忽略非 ASCII 字符」的模糊匹配兜底。
+    """
+    if not path:
+        return ""
+    if os.path.isfile(path):
+        return path
+    d = os.path.dirname(path) or "."
+    name = os.path.basename(path)
+    if not os.path.isdir(d) or not name:
+        return path
+
+    def norm(s):
+        return "".join(ch for ch in s if ord(ch) < 128).lower()
+
+    target = norm(name)
+    if not target:
+        return path
+    try:
+        for f in os.listdir(d):
+            if norm(f) == target:
+                return os.path.join(d, f)
+    except Exception:
+        pass
+    return path
+
+
 def find_ffmpeg():
     """优先用 exe 同级 bin/ffmpeg.exe（exe 版首次运行会从内置资源解压过来），
     其次系统 PATH 里的 ffmpeg。"""
@@ -362,6 +419,16 @@ def build_cmd(task):
     ]
     if FFMPEG:
         cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
+
+    # 真实文件路径单独写文件：yt-dlp 输出到管道时用系统编码（中文 Windows 是 cp936），
+    # 文件名里的 emoji 会被丢掉，导致后续「打开目录 / 预览 / 去水印」找不到文件。
+    path_file = os.path.join(APP_DIR, "cache", "path_%s.txt" % task["id"])
+    try:
+        os.makedirs(os.path.dirname(path_file), exist_ok=True)
+    except Exception:
+        pass
+    cmd += ["--print-to-file", "after_move:%(filepath)s", path_file]
+    task["_path_file"] = path_file
 
     preset = o.get("preset") or "best"
     fmt = (o.get("format") or "").strip()
@@ -1558,6 +1625,10 @@ def run_task(task):
         code = proc.wait()
         PROCS.pop(tid, None)
 
+    # 用 --print-to-file 的 UTF-8 输出修正真实路径（绕开管道编码丢字符的问题）
+    if code == 0 and not task.get("cancel"):
+        apply_real_path(task)
+
     # 剪辑双轨：确保是纯轨（源为混流单文件时无损抽出）
     if code == 0 and not task.get("cancel") and task["opts"].get("track") in ("video", "audio"):
         try:
@@ -1883,6 +1954,7 @@ class Handler(BaseHTTPRequestHandler):
                 if part.startswith("path="):
                     target = unquote(part[5:])
                     break
+            target = resolve_existing(target)
             if not target or not os.path.isfile(target) or not FFMPEG:
                 return self._send(404, {"ok": False, "error": "不可用"})
             try:
@@ -1903,6 +1975,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, f.read(), "image/jpeg")
             except Exception as e:
                 return self._send(500, {"ok": False, "error": str(e)})
+        if path == "/api/ai/status":
+            st = ai_status()
+            return self._send(200, {
+                "ok": True,
+                "ready": bool(st.get("ready")),
+                "error": st.get("error") or "",
+                "model": AI_MODEL,
+                "modelExists": os.path.isfile(AI_MODEL),
+            })
         if path == "/api/media":
             # 视频预览流（支持 Range，让浏览器能拖时间轴）
             q = urlparse(self.path).query
@@ -1911,6 +1992,7 @@ class Handler(BaseHTTPRequestHandler):
                 if part.startswith("path="):
                     target = unquote(part[5:])
                     break
+            target = resolve_existing(target)
             if not target or not os.path.isfile(target):
                 return self._send(404, {"ok": False, "error": "文件不存在"})
             return self._serve_media(target)
@@ -2074,7 +2156,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": False, "error": "未选择目录"})
 
         if path == "/api/open":
-            target = body.get("path") or config.get("outdir")
+            target = resolve_existing(body.get("path") or "") or config.get("outdir")
             try:
                 if not os.path.exists(target):
                     return self._send(200, {"ok": False, "error": "路径不存在：%s" % target})
@@ -2084,7 +2166,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": False, "error": str(e)})
 
         if path == "/api/openfile":
-            f = body.get("path") or ""
+            f = resolve_existing(body.get("path") or "")
             if f and os.path.isfile(f):
                 try:
                     open_file(f)
@@ -2138,6 +2220,7 @@ class Handler(BaseHTTPRequestHandler):
                 with task_lock:
                     t = TASKS.get(tid)
                     target = (t or {}).get("filename") or ""
+            target = resolve_existing(target)
             if not target or not os.path.isfile(target):
                 return self._send(200, {"ok": False, "error": "找不到视频文件（请先下载完成）"})
             try:
@@ -2152,7 +2235,7 @@ class Handler(BaseHTTPRequestHandler):
             src_id = (body.get("id") or "").strip()
             with task_lock:
                 src_task = dict(TASKS.get(src_id) or {})
-            src_path = src_task.get("filename") or ""
+            src_path = resolve_existing(src_task.get("filename") or "")
             if not src_path or not os.path.isfile(src_path):
                 return self._send(200, {"ok": False, "error": "任务不存在或文件已删除"})
             wm = body.get("watermark") or {}
