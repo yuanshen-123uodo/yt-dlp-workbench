@@ -2883,8 +2883,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/open":
             target = resolve_existing(body.get("path") or "") or config.get("outdir")
             try:
+                # 文件本身没了但目录还在的话，仍然把目录打开（open_in_explorer 里退到父目录）
                 if not os.path.exists(target):
-                    return self._send(200, {"ok": False, "error": "路径不存在：%s" % target})
+                    parent = os.path.dirname(os.path.normpath(target))
+                    if not (parent and os.path.isdir(parent)):
+                        return self._send(200, {"ok": False, "error": "路径不存在：%s" % target})
                 open_in_explorer(target)
                 return self._send(200, {"ok": True})
             except Exception as e:
@@ -3080,22 +3083,118 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False, "error": "unknown api"})
 
 
+def _win_select_file(path):
+    """在资源管理器里打开所在目录并选中该文件。成功返回 True。
+
+    不能用 `explorer /select,路径`：实测本机（Win11）explorer 会把参数整个丢掉，
+    不管路径有没有空格、是不是中文，一律打开默认的「文档」——用户看到的就是
+    「点打开所在目录，跳到的不是它的位置」。改成走 Shell 官方接口
+    SHOpenFolderAndSelectItems，参数由 PIDL 传递，不经过 explorer 的命令行解析。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes, c_void_p, c_uint, POINTER, byref
+
+        # 某些调用方所在线程可能已经初始化过 COM，这里失败（RPC_E_CHANGED_MODE）也无所谓
+        try:
+            ctypes.windll.ole32.CoInitialize(None)
+        except Exception:
+            pass
+
+        sh = ctypes.windll.shell32
+        sh.SHParseDisplayName.restype = ctypes.c_long
+        sh.SHParseDisplayName.argtypes = [
+            wintypes.LPCWSTR, c_void_p, POINTER(c_void_p), c_uint, POINTER(c_uint),
+        ]
+        # 不声明 argtypes 时指针参数会被截成 32 位，必然返回 E_INVALIDARG（踩过）
+        sh.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+        sh.SHOpenFolderAndSelectItems.argtypes = [
+            c_void_p, c_uint, c_void_p, wintypes.DWORD,
+        ]
+
+        pidl = c_void_p()
+        attrs = c_uint(0)
+        if sh.SHParseDisplayName(path, None, byref(pidl), 0, byref(attrs)) != 0:
+            return False
+        if not pidl.value:
+            return False
+        try:
+            return sh.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0
+        finally:
+            try:
+                ctypes.windll.ole32.CoTaskMemFree(pidl)
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
+def _win_wait_folder(folder, timeout=1.6):
+    """轮询是否有资源管理器窗口正显示这个目录（按窗口标题里的目录名判断）。
+
+    SHOpenFolderAndSelectItems 返回 S_OK 不等于窗口真的开了——本机上连
+    SHParseDisplayName 都直接返回 E_INVALIDARG，所以凡是「接口成功」都要再核对一次，
+    否则会出现「点了没反应」。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u = ctypes.windll.user32
+        EP = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        name = os.path.basename(os.path.normpath(folder)).lower()
+        if not name:
+            return False
+        end = time.time() + timeout
+        while time.time() < end:
+            found = []
+
+            def cb(h, _):
+                b = ctypes.create_unicode_buffer(64)
+                u.GetClassNameW(h, b, 64)
+                if b.value in ("CabinetWClass", "ExploreWClass"):
+                    t = ctypes.create_unicode_buffer(512)
+                    u.GetWindowTextW(h, t, 512)
+                    if name in (t.value or "").lower():
+                        found.append(h)
+                return True
+
+            u.EnumWindows(EP(cb), 0)
+            if found:
+                return True
+            time.sleep(0.2)
+    except Exception:
+        pass
+    return False
+
+
 def open_in_explorer(target):
-    """打开目录；若 target 是文件则选中该文件。"""
+    """打开 target 所在目录；若 target 是文件，尽量顺带选中它。"""
     target = os.path.normpath(target)
-    if os.path.isfile(target):
-        if os.name == "nt":
-            # explorer 要求 /select, 与路径是同一个参数，拆开传会失效
-            subprocess.Popen(["explorer", "/select," + target])
+    is_file = os.path.isfile(target)
+    if not is_file and not os.path.isdir(target):
+        # 文件可能已被移动/删除，退到父目录，别让按钮彻底失效
+        parent = os.path.dirname(target)
+        if parent and os.path.isdir(parent):
+            target, is_file = parent, False
         else:
-            subprocess.Popen(["xdg-open", os.path.dirname(target) or "."])
-        return
+            raise FileNotFoundError(target)
+
+    folder = (os.path.dirname(target) or ".") if is_file else target
+
     if os.name == "nt":
-        os.startfile(target)
+        if is_file and _win_select_file(target) and _win_wait_folder(folder):
+            return
+        # ShellExecute 打开目录：不经过 explorer 命令行，位置必然正确
+        os.startfile(folder)
     elif sys.platform == "darwin":
-        subprocess.Popen(["open", target])
+        subprocess.Popen(["open", "-R", target] if is_file else ["open", folder])
     else:
-        subprocess.Popen(["xdg-open", target])
+        subprocess.Popen(["xdg-open", folder])
 
 
 def open_file(f):
