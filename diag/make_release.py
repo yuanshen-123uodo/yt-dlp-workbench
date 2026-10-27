@@ -10,51 +10,55 @@ import sys
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TAG = "v1.6"
+TAG = "v1.8"
 EXE = os.path.join(ROOT, "dist", "yt-dlp-workbench.exe")
 REPO = "yuanshen-123uodo/yt-dlp-workbench"
 
-NAME = "v1.6 — 超分画质全链路修复（色彩 / HDR / 降噪 / 锐化 / 编码）"
-BODY = """上一版把超分改成分块之后，处理速度能用了，但画质链路上还有一堆问题没处理。
-这一版把它们一次清掉。
+NAME = "v1.8 — 修复「打开所在目录」跳到错误位置"
+BODY = """点任务卡片上的 📁「打开所在目录」，资源管理器打开的是「文档」，不是视频真正所在的文件夹。
+这一版修的就是它。
 
-## 修了一个真 bug：输出颜色发灰
+## 为什么跳错地方
 
-之前合帧只有 `-pix_fmt yuv420p`，没写色彩标记。ffmpeg 转 YUV 时按 BT.709 算的数值，
-但 mp4 容器里 `color_space` 是 `unknown`——播放器遇到空值普遍按 BT.601 解码。
-结果就是 BT.709 的片源发灰、肤色偏绿。
+原来的写法是 `explorer /select,<路径>`。实测在本机（Win11）上，**给 explorer.exe 传的参数被整条丢弃**，
+它一律打开默认目录。四种写法逐个试过：
 
-现在每段编码和最终合并都按源的实际色彩空间写入 `colorspace / color_primaries /
-color_trc / color_range`，播放器用同一套矩阵解码。
+| 写法 | 实际打开 |
+|---|---|
+| `Popen(["explorer", "/select," + path])` | 文档 |
+| `Popen('explorer /select,"path"')` | 桌面 |
+| `Popen(["explorer", folder])` | 文档 |
+| `ShellExecuteW("explorer.exe", '/select,"path"')` | 桌面 |
+| `os.startfile(folder)` | ✅ 正确 |
 
-## HDR 片源不再变黑
+也就是说与引号、空格、中文都无关，是「给 explorer 传参数」这条路本身不通。
+只要不传参数、让 ShellExecute 自己去开目录，位置就完全正确。
 
-10bit PQ / HLG 直接截断成 8bit JPEG，高光会整片压平、整体发暗。现在识别到 HDR
-会在抽帧前先 tonemap：`zscale` 转线性光 → `tonemap=hable` → 回 BT.709。
+## 怎么修的
 
-## 抽帧改 4:4:4
+1. 文件目标优先用 Shell 官方接口 `SHOpenFolderAndSelectItems`，路径通过 PIDL 传递，
+   绕开 explorer 的命令行解析，顺带能把文件选中高亮。
+2. 接口不可用时退化为 `os.startfile(目录)`——位置保证正确，只是不高亮文件。
+3. 加了结果校验：接口返回 S_OK 不代表窗口真的开了，必须轮询到资源管理器窗口标题里
+   出现目标目录名才算成功，否则继续走退化路径。防的就是「点了没反应」这类静默失败。
+4. 文件已被删除但目录还在时，退到父目录打开，不再直接报「路径不存在」。
 
-JPEG 默认存 4:2:0，色度被压两次（抽帧一次、编码一次），红色字幕和彩色渐变的边缘
-会糊两次。改存 4:4:4 只多 18% 体积。抽帧质量也从 q2 提到 q1。
+## 测试
 
-## 新增三组画质选项
+新增 `diag/test_openfolder.py`，判据是**窗口标题里必须出现目标目录名**，
+不是「Popen 没抛异常」——后者在原来的 bug 下也是通过的，等于没测。
 
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| 降噪 | 按分辨率自动 | AI 会把压缩块和噪点当细节一起放大，所以降噪必须在超分**之前**。480P 以下默认强力、720P 中等、1080P 轻微 |
-| 锐化 | 中等 | Real-ESRGAN 是回归式超分，输出干净但偏软，`cas` 只提边缘不放大噪点 |
-| 编码质量 | 高（crf16） | 超分后细节密度高，crf18 会把刚补出来的细节再糊回去 |
+| 场景 | 结果 |
+|---|---|
+| 文件 → 所在目录 | 通过 |
+| 目录 → 目录本身 | 通过 |
+| 文件已删除 → 退父目录 | 通过 |
+| 下载根目录 | 通过 |
+| 不存在的路径 | 正确报错 |
+| 打包 exe · `/api/open` | 通过 |
 
-面板上还会显示源信息（分辨率 · 编码 · 位深 · 色彩空间），HDR 会标黄提示。
-
-## 其他
-
-- exe 体积回到 74.8MB（打包时排除了被 hook 误收的 pandas / pyarrow / scipy，
-  否则会涨到 160MB）
-- 新增 `diag/` 四个测试脚本，覆盖源码 ffmpeg 9.0、内置 ffmpeg 7.1、无 ffprobe
-  回退、HDR 四种环境
-
-> 分块处理、音频直通、时长帧率保持这些上一版的行为不变。
+测试路径故意带中文、空格和方括号（`_目录 测试[1]/样片 [test].mp4`），
+因为这三样最容易在命令行传参时被吃掉。
 """
 
 ctx = ssl._create_unverified_context()
