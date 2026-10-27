@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import ssl
 import subprocess
 import sys
@@ -3107,88 +3108,225 @@ def open_file(f):
         subprocess.Popen(["xdg-open", f])
 
 
+# ---- 系统文件对话框 ----
+# 踩过的坑（真机上反复调出来的，每条都验证过）：
+#  1) 服务进程是后台进程，直接 ShowDialog() 的对话框抢不到前台，会落在别的窗口后面。
+#     用户点「导入」只看到按钮卡在「选择文件…」，以为点了没反应，其实进程在等一个看不见的窗口。
+#  2) 只把 owner Form 的 TopMost 设成 true 不够——owned dialog 不继承 owner 的 TopMost。
+#  3) Timer.Add_Tick({...}) 传 PowerShell 脚本块**不会执行**：ShowDialog 阻塞在 .NET 调用上时
+#     PowerShell 引擎没有机会跑 ScriptBlock。必须用 C# 委托，纯 .NET 回调才能在嵌套消息循环里跑到。
+#  4) 不能拿 IsWindowVisible 判断"用户看得见"，它只反映 WS_VISIBLE 标志，被完全遮住照样是 True。
+#     要探窗口中心点 WindowFromPoint 是不是它自己（见 diag/test_picker.py）。
+# 做法：C# 里建隐形 owner + Timer，一旦 FindWindow 到对话框就 SetWindowPos(HWND_TOPMOST)；
+# 脚本落成 .ps1 用 -File 执行（避开 -Command 的引号地狱）；结果写 UTF-8 文件再读回，
+# 彻底绕开 PowerShell 控制台 GBK 编码（中文路径会碎成方块）。
+_PS_PICKER = r'''param(
+    [Parameter(Mandatory=$true)][string]$Mode,
+    [Parameter(Mandatory=$true)][string]$OutFile,
+    [string]$Title = '选择文件',
+    [string]$Filter = '所有文件|*.*'
+)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Text;
+using System.Windows.Forms;
+using System.Runtime.InteropServices;
+
+public class WbPick {
+    [DllImport("user32.dll")]
+    static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")]
+    static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")]
+    static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")]
+    static extern int GetSystemMetrics(int idx);
+    [DllImport("user32.dll")]
+    static extern bool EnumThreadWindows(int tid, EnumThreadDelegate cb, IntPtr p);
+    [DllImport("kernel32.dll")]
+    static extern int GetCurrentThreadId();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassName(IntPtr h, StringBuilder buf, int max);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT { public int Left, Top, Right, Bottom; }
+
+    delegate bool EnumThreadDelegate(IntPtr h, IntPtr p);
+
+    static Timer timer;
+    static bool placed = false;
+    static IntPtr dlg = IntPtr.Zero;
+
+    // 按窗口类名找对话框，而不是按标题：FolderBrowserDialog 的标题是系统本地化的
+    // （中文系统上叫"浏览文件夹"），拿 Description 去 FindWindow 根本找不到。
+    // 系统对话框的窗口类固定是 #32770，枚举当前线程的窗口就够。
+    static bool Collect(IntPtr h, IntPtr p) {
+        StringBuilder sb = new StringBuilder(128);
+        GetClassName(h, sb, 128);
+        if (sb.ToString() == "#32770") {
+            dlg = h;
+            return false;
+        }
+        return true;
+    }
+
+    static IntPtr FindDialog() {
+        dlg = IntPtr.Zero;
+        EnumThreadWindows(GetCurrentThreadId(), new EnumThreadDelegate(Collect), IntPtr.Zero);
+        return dlg;
+    }
+
+    static void Boost(object sender, EventArgs e) {
+        IntPtr h = dlg != IntPtr.Zero ? dlg : FindDialog();
+        if (h == IntPtr.Zero) return;
+
+        if (!placed) {
+            // 第一次：owner 在屏幕外，对话框会跟着落到屏幕外或被挤到角落，
+            // 这里显式搬到屏幕中央并强制显示。GetWindowRect 对隐藏窗口会撒谎返回 (0,0)，
+            // 所以不能信它来判断"在不在屏幕里"。
+            RECT r;
+            GetWindowRect(h, out r);
+            int w = r.Right - r.Left;
+            int ht = r.Bottom - r.Top;
+            int sw = GetSystemMetrics(0);
+            int sh = GetSystemMetrics(1);
+            int x = (sw - w) / 2;
+            int y = (sh - ht) / 2;
+            // HWND_TOPMOST(-1) | SWP_NOSIZE(0x1) | SWP_SHOWWINDOW(0x40)
+            SetWindowPos(h, (IntPtr)(-1), x, y, 0, 0, 0x0041);
+            ShowWindow(h, 5);  // SW_SHOW
+            placed = true;
+        } else {
+            // 之后持续压制：桌宠、悬浮窗这类常驻 TopMost 应用会在我们置顶之后又把自己
+            // 顶回来（实测中心点最上层变成了 Chrome_WidgetWin_1）。所以隔一会儿就重申一次
+            // 置顶权，直到对话框关闭。
+            // HWND_TOPMOST(-1) | SWP_NOSIZE(0x1) | SWP_NOMOVE(0x2)
+            SetWindowPos(h, (IntPtr)(-1), 0, 0, 0, 0, 0x0003);
+        }
+        SetForegroundWindow(h);
+    }
+
+    public static string[] Show(string title, string filter, bool folder) {
+        // 隐形 owner：1x1、无边框、摆到屏幕外左侧。
+        // 坐标别用 -32000：那是 Windows 表示"最小化窗口"的约定值，owned dialog 会被
+        // 连带创建成隐藏/最小化状态，窗口存在但用户永远看不见（踩过）。
+        Form owner = new Form();
+        owner.FormBorderStyle = FormBorderStyle.None;
+        owner.ShowInTaskbar = false;
+        owner.StartPosition = FormStartPosition.Manual;
+        owner.Size = new Size(1, 1);
+        owner.Location = new Point(-3000, -3000);
+        owner.Show();
+        owner.Activate();
+        Application.DoEvents();
+
+        placed = false;
+        dlg = IntPtr.Zero;
+        timer = new Timer();
+        timer.Interval = 250;   // 持续置顶的节奏，太密会和别的 TopMost 应用来回闪
+        timer.Tick += new EventHandler(Boost);
+        timer.Start();
+
+        string[] result = new string[0];
+        if (folder) {
+            FolderBrowserDialog d = new FolderBrowserDialog();
+            d.Description = title;
+            d.ShowNewFolderButton = true;
+            if (d.ShowDialog(owner) == DialogResult.OK) {
+                result = new string[] { d.SelectedPath };
+            }
+        } else {
+            OpenFileDialog d = new OpenFileDialog();
+            d.Title = title;
+            d.Multiselect = true;
+            d.CheckFileExists = true;
+            d.Filter = filter;
+            if (d.ShowDialog(owner) == DialogResult.OK) {
+                result = d.FileNames;
+            }
+        }
+        timer.Stop();
+        timer.Dispose();
+        owner.Close();
+        return result;
+    }
+}
+'@
+
+$files = [WbPick]::Show($Title, $Filter, ($Mode -eq 'folder'))
+if ($files -and $files.Count -gt 0) {
+    Set-Content -LiteralPath $OutFile -Value $files -Encoding UTF8
+} else {
+    Set-Content -LiteralPath $OutFile -Value '' -Encoding UTF8
+}
+'''
+
+MEDIA_FILTER = (
+    "媒体文件|*.mp4;*.mkv;*.webm;*.mov;*.avi;*.flv;*.ts;*.m4v;*.wmv;*.mpg;*.mpeg;"
+    "*.m4a;*.mp3;*.aac;*.flac;*.wav;*.ogg;*.opus|所有文件|*.*"
+)
+
+
+def run_picker(mode, title, filt="", timeout=300):
+    """弹系统选择器，返回选中路径列表；用户取消返回 []。
+
+    mode 取 "files"（多选文件）或 "folder"（选目录）。
+    """
+    tmpd = tempfile.mkdtemp(prefix="wbpick_")
+    ps1 = os.path.join(tmpd, "picker.ps1")
+    out = os.path.join(tmpd, "out.txt")
+    try:
+        with open(ps1, "w", encoding="utf-8-sig") as f:
+            f.write(_PS_PICKER)
+        cmd = ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass",
+               "-File", ps1, "-Mode", mode, "-OutFile", out, "-Title", title]
+        if filt:
+            cmd += ["-Filter", filt]
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                           creationflags=CREATE_NO_WINDOW)
+        if not os.path.isfile(out):
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()
+            try:
+                add_log("选择器未产出结果：%s" % (err[:240] or "rc=%d" % r.returncode))
+            except Exception:
+                pass
+            return []
+        with open(out, "r", encoding="utf-8-sig", errors="replace") as f:
+            return [l.strip() for l in f.read().splitlines() if l.strip()]
+    except subprocess.TimeoutExpired:
+        try:
+            add_log("选择器超时（%d 秒未操作）" % timeout)
+        except Exception:
+            pass
+        return []
+    except Exception as e:
+        try:
+            add_log("选择器异常：%s" % e)
+        except Exception:
+            pass
+        return []
+    finally:
+        try:
+            defer_rmtree(tmpd)
+        except Exception:
+            pass
+
+
 def pick_folder():
-    """优先用 PowerShell 的系统文件夹选择器（不依赖 Python 是否带 tkinter）。"""
-    try:
-        ps = (
-            "Add-Type -AssemblyName System.Windows.Forms;"
-            "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
-            "$d.Description = '选择下载保存目录';"
-            "$d.ShowNewFolderButton = $true;"
-            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK)"
-            " { Write-Output $d.SelectedPath }"
-        )
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-STA", "-Command", ps],
-            capture_output=True, text=True, timeout=240,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        if r.returncode == 0:
-            lines = [l.strip() for l in (r.stdout or "").splitlines() if l.strip()]
-            return lines[-1] if lines else None
-    except Exception:
-        pass
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        result = {"path": None}
-
-        def work():
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            result["path"] = filedialog.askdirectory(title="选择下载保存目录")
-            root.destroy()
-
-        th = threading.Thread(target=work, daemon=True)
-        th.start()
-        th.join(timeout=240)
-        return result["path"]
-    except Exception:
-        return None
+    """系统文件夹选择器。返回路径，取消返回 None。"""
+    got = run_picker("folder", "选择下载保存目录")
+    return got[0] if got else None
 
 
 def pick_files():
-    """系统文件选择器，支持多选。返回路径列表。"""
-    try:
-        ps = (
-            "Add-Type -AssemblyName System.Windows.Forms;"
-            "$d = New-Object System.Windows.Forms.OpenFileDialog;"
-            "$d.Title = '选择要处理的视频或音频文件';"
-            "$d.Multiselect = $true;"
-            "$d.Filter = '媒体文件|*.mp4;*.mkv;*.webm;*.mov;*.avi;*.flv;*.ts;*.m4v;*.wmv;*.mpg;*.mpeg;*.m4a;*.mp3;*.aac;*.flac;*.wav;*.ogg;*.opus|所有文件|*.*';"
-            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK)"
-            " { foreach ($f in $d.FileNames) { Write-Output $f } }"
-        )
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-STA", "-Command", ps],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=300, creationflags=CREATE_NO_WINDOW,
-        )
-        if r.returncode == 0:
-            return [l.strip() for l in (r.stdout or "").splitlines() if l.strip()]
-    except Exception:
-        pass
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        result = {"paths": []}
-
-        def work():
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            result["paths"] = list(filedialog.askopenfilenames(title="选择要处理的媒体文件") or [])
-            root.destroy()
-
-        th = threading.Thread(target=work, daemon=True)
-        th.start()
-        th.join(timeout=300)
-        return result["paths"]
-    except Exception:
-        return []
+    """系统文件选择器，支持多选。返回路径列表，取消返回 []。"""
+    return run_picker("files", "选择要处理的视频或音频文件", MEDIA_FILTER)
 
 
 def pick_port(start=8765):

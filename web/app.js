@@ -501,6 +501,11 @@ $("#btnImport").addEventListener("click", async () => {
   const old = b.innerHTML;
   b.disabled = true;
   b.textContent = "选择文件…";
+  // 系统对话框要等 PowerShell 起来，约 1–2 秒；超时还没回来就提示一句，
+  // 免得用户以为又点了没反应
+  const hint = setTimeout(() => {
+    toast("文件选择窗口已打开，没看到的话按 Alt+Tab 找一下", "warn", 4200);
+  }, 1600);
   try {
     const r = await api("/api/import", { pick: true });
     if (r.cancelled) return;
@@ -511,6 +516,7 @@ $("#btnImport").addEventListener("click", async () => {
   } catch (e) {
     toast("导入失败：" + e.message, "err", 3600);
   } finally {
+    clearTimeout(hint);
     b.disabled = false;
     b.innerHTML = old;
   }
