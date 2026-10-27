@@ -1316,6 +1316,16 @@ def setup_upscale():
     return True, "引擎安装完成（%d 个模型，%.0f MB）" % (len(models), total / 1048576.0)
 
 
+def upscale_space_estimate(W, H, scale, frames):
+    """估算超分一段帧需要多少临时空间（字节）。
+
+    系数是实测的（JPEG q:v 2）：输入帧约 0.45 字节/像素，超分后的帧约 0.18 字节/像素
+    （超分后画面更平滑，压缩率更高）。取偏保守值，宁可提前拒绝也不要写满用户磁盘。
+    """
+    per_frame = int(W) * int(H) * 0.45 + (int(W) * scale) * (int(H) * scale) * 0.18
+    return int(max(1, frames) * per_frame)
+
+
 def process_upscale(task, src, dst, opts):
     """画质提升管线：抽帧 → Real-ESRGAN 超分 → 合帧（音频直通）。"""
     tid = task["id"]
@@ -1345,89 +1355,161 @@ def process_upscale(task, src, dst, opts):
             model = models[0]
 
     work = os.path.join(APP_DIR, "cache", "up_" + tid)
-    fin = os.path.join(work, "in")
-    fout = os.path.join(work, "out")
     safe_rmtree(work)
     try:
-        os.makedirs(fin, exist_ok=True)
-        os.makedirs(fout, exist_ok=True)
+        os.makedirs(work, exist_ok=True)
     except Exception as e:
         add_log("画质提升失败：无法创建临时目录 %s" % e, tid, "error")
         return False
 
-    add_log("画质提升：%dx%d → %dx%d，模型 %s，抽帧中…" % (W, H, W * scale, H * scale, model), tid)
-    with task_lock:
-        task["percent"] = 0.0
+    CHUNK = 900  # 每块帧数；1080P 每块约 1.5–2GB 临时空间，处理完立即释放
+
+    fps_v = float(fps or 25.0)
+    dur = float(info.get("duration") or 0)
+    frames_total = int(round(dur * fps_v)) if dur > 0 else 0
+    if frames_total <= 0:
+        add_log("画质提升失败：读不到视频时长，无法分块处理", tid, "error")
+        return False
+
+    need_chunk = upscale_space_estimate(W, H, scale, min(frames_total, CHUNK))
+    try:
+        free = shutil.disk_usage(APP_DIR).free
+    except Exception:
+        free = 0
+    add_log("画质提升：%dx%d → %dx%d，共 %d 帧，分 %d 块处理（模型 %s）"
+            % (W, H, W * scale, H * scale, frames_total,
+               (frames_total + CHUNK - 1) // CHUNK, model), tid)
+    if free and free < need_chunk:
+        add_log("画质提升失败：临时空间不足，单块约需 %.1fGB，当前可用 %.1fGB"
+                % (need_chunk / 1073741824.0, free / 1073741824.0), tid, "error")
+        return False
 
     try:
-        # 1) 抽帧（JPEG q2，兼顾体积与质量）
-        r = subprocess.run(
-            [FFMPEG, "-y", "-v", "error", "-i", src, "-q:v", "2",
-             os.path.join(fin, "%08d.jpg")],
-            capture_output=True, timeout=7200, creationflags=CREATE_NO_WINDOW,
-        )
-        if r.returncode != 0:
-            add_log("抽帧失败：%s" % (r.stderr or b"").decode("utf-8", "replace")[:300], tid, "error")
-            return False
-        frames = sorted(f for f in os.listdir(fin) if f.endswith(".jpg"))
-        total = len(frames)
-        if not total:
-            add_log("抽帧失败：没有输出帧", tid, "error")
-            return False
-        add_log("画质提升：共 %d 帧，开始超分（可最小化窗口，进度见任务列表）" % total, tid)
-
-        # 2) 超分
-        proc = subprocess.Popen(
-            [UP_EXE, "-i", fin, "-o", fout, "-n", model, "-s", str(scale),
-             "-t", "0", "-f", "jpg", "-j", "1:2:2"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, bufsize=0,
-            creationflags=CREATE_NO_WINDOW, cwd=UP_DIR,
-        )
-        PROCS[tid] = proc
-        for raw in proc.stdout:
-            line = decode_line(raw)
-            m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
-            if m:
-                pct = float(m.group(1))
-                with task_lock:
-                    task["percent"] = min(90.0, pct * 0.9)
-                    task["phase"] = "超分中 %d/%d 帧" % (int(pct * total / 100), total)
+        segs = []
+        start = 0
+        while start < frames_total:
             if task.get("cancel"):
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                add_log("画质提升已取消", tid, "warn")
+                return False
+            n = min(CHUNK, frames_total - start)
+            binp = os.path.join(work, "ci%04d" % len(segs))
+            bout = os.path.join(work, "co%04d" % len(segs))
+            for d in (binp, bout):
+                safe_rmtree(d)
+                os.makedirs(d, exist_ok=True)
+
+            # 1) 抽这一块（JPEG q2）
+            cmd = [FFMPEG, "-y", "-v", "error"]
+            if start > 0:
+                cmd += ["-ss", "%.3f" % (start / fps_v)]
+            cmd += ["-i", src, "-q:v", "2", "-frames:v", str(n),
+                    os.path.join(binp, "%08d.jpg")]
+            # 登记到 PROCS：否则 guard_stuck 会把长片抽帧误判为「无进度且无子进程」
+            dec = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+            PROCS[tid] = dec
+            try:
+                derr, _ = dec.communicate()
+            finally:
+                PROCS.pop(tid, None)
+            got = len([f for f in os.listdir(binp) if f.endswith(".jpg")])
+            if got == 0 and start > 0:
+                # 帧数是用「时长 × 帧率」估的，可能比实际多一两帧；到尾了直接收工
                 break
-        code = proc.wait()
-        PROCS.pop(tid, None)
-        if code != 0 or task.get("cancel"):
-            add_log("超分中断（退出码 %d）" % code, tid, "warn")
-            return False
+            if dec.returncode != 0 or not got:
+                add_log("抽帧失败：%s" % (derr or b"").decode("utf-8", "replace")[:300], tid, "error")
+                return False
 
-        outs = sorted(f for f in os.listdir(fout) if f.endswith(".jpg"))
-        if not outs:
-            add_log("超分失败：没有输出帧", tid, "error")
-            return False
+            # 2) 超分这一块
+            proc = subprocess.Popen(
+                [UP_EXE, "-i", binp, "-o", bout, "-n", model, "-s", str(scale),
+                 "-t", "0", "-f", "jpg", "-j", "1:2:2"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, bufsize=0,
+                creationflags=CREATE_NO_WINDOW, cwd=UP_DIR,
+            )
+            PROCS[tid] = proc
+            for raw in proc.stdout:
+                line = decode_line(raw)
+                m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+                if m:
+                    pct = float(m.group(1))
+                    overall = (start + got * pct / 100.0) / frames_total
+                    np_pct = min(95.0, overall * 95.0)
+                    # realesrgan 多线程时打印的百分比会来回跳，这里只允许单调递增
+                    with task_lock:
+                        if np_pct > (task.get("percent") or 0):
+                            task["percent"] = np_pct
+                        task["phase"] = "超分中 %d/%d 帧" % (
+                            min(int(start + got * pct / 100.0), frames_total), frames_total)
+                if task.get("cancel"):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    break
+            code = proc.wait()
+            PROCS.pop(tid, None)
+            if code != 0 or task.get("cancel"):
+                add_log("超分中断（退出码 %d）" % code, tid, "warn")
+                return False
 
-        # 3) 合帧 + 音频直通
-        add_log("画质提升：合帧编码中（%d 帧）…" % len(outs), tid)
+            outs = sorted(f for f in os.listdir(bout) if f.endswith(".jpg"))
+            if not outs:
+                add_log("超分失败：这一块没有输出帧", tid, "error")
+                return False
+
+            # 3) 这一块编码成独立片段（不带音频），随后立刻清掉帧
+            seg = os.path.join(work, "seg%04d.mp4" % len(segs))
+            enc = subprocess.Popen(
+                [FFMPEG, "-y", "-v", "error",
+                 "-framerate", "%.6f" % fps_v, "-i", os.path.join(bout, "%08d.jpg"),
+                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                 "-pix_fmt", "yuv420p", seg],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
+            )
+            PROCS[tid] = enc
+            try:
+                eerr, _ = enc.communicate()
+            finally:
+                PROCS.pop(tid, None)
+            if enc.returncode != 0:
+                add_log("分块编码失败：%s" % (eerr or b"").decode("utf-8", "replace")[:300], tid, "error")
+                return False
+            segs.append(seg)
+            start += got
+            safe_rmtree(binp)
+            safe_rmtree(bout)
+
+        # 4) 合并所有片段 + 音频直通
+        listf = os.path.join(work, "segs.txt")
+        with open(listf, "w", encoding="utf-8") as f:
+            for s in segs:
+                f.write("file '%s'\n" % s.replace("\\", "/").replace("'", "'\\''"))
+        add_log("画质提升：合并 %d 段并直通音频…" % len(segs), tid)
         with task_lock:
-            task["percent"] = 90.0
-            task["phase"] = "合帧编码"
-        r = subprocess.run(
-            [FFMPEG, "-y", "-v", "error",
-             "-framerate", str(fps), "-i", os.path.join(fout, "%08d.jpg"),
+            task["percent"] = 97.0
+            task["phase"] = "合并编码"
+        mux = subprocess.Popen(
+            [FFMPEG, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listf,
              "-i", src, "-map", "0:v:0", "-map", "1:a:0?", "-dn", "-sn",
              # 章节会让 mp4 封装额外写一条 text 轨道（部分播放器识别成坏字幕流），去掉
              "-map_chapters", "-1",
-             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-             "-c:a", "copy", dst],
-            capture_output=True, timeout=7200, creationflags=CREATE_NO_WINDOW,
+             "-c", "copy", "-movflags", "+faststart", dst],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
         )
-        if r.returncode != 0:
-            add_log("合帧失败：%s" % (r.stderr or b"").decode("utf-8", "replace")[:300], tid, "error")
+        PROCS[tid] = mux
+        try:
+            merr, _ = mux.communicate(timeout=7200)
+        except subprocess.TimeoutExpired:
+            mux.kill()
+            merr, _ = mux.communicate()
+        finally:
+            PROCS.pop(tid, None)
+        if mux.returncode != 0:
+            add_log("合并失败：%s" % (merr or b"").decode("utf-8", "replace")[:300], tid, "error")
             return False
         with task_lock:
             task["percent"] = 100.0
