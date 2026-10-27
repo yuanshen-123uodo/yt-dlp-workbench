@@ -530,3 +530,15 @@ kbd{
 }
 .up-engine.ready{background:rgba(53,208,127,.08);border-color:rgba(53,208,127,.25)}
 .up-engine.ready #upSetup{display:none}
+.up-opts{
+  display:flex;flex-direction:column;gap:7px;padding:10px;border-radius:10px;
+  background:rgba(255,255,255,.03);border:1px solid var(--line);
+}
+.up-opt{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.up-opt>span{font-size:11.5px;color:var(--muted);flex:none}
+.up-opt select{
+  width:118px;padding:5px 6px;font-size:11.5px;font-family:inherit;
+  border-radius:7px;border:1px solid var(--line-2);
+  background:rgba(255,255,255,.05);color:var(--text);cursor:pointer;outline:none;
+}
+.up-opt select:hover{border-color:rgba(255,255,255,.2)}

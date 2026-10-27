@@ -307,7 +307,36 @@
           <span id="upEngineState">检查引擎…</span>
           <button class="btn btn-soft sm" id="upSetup">下载引擎（45MB）</button>
         </div>
-        <p class="sec-note" id="upNote">有独显时约 15–20 分钟 / 分钟视频；核显会慢 3–5 倍</p>
+        <div class="up-opts">
+          <div class="up-opt">
+            <span>降噪</span>
+            <select id="upDenoise">
+              <option value="off">关闭</option>
+              <option value="light">轻微</option>
+              <option value="medium">中等</option>
+              <option value="strong">强力</option>
+            </select>
+          </div>
+          <div class="up-opt">
+            <span>锐化</span>
+            <select id="upSharpen">
+              <option value="off">关闭</option>
+              <option value="light">轻微</option>
+              <option value="medium" selected>中等</option>
+              <option value="strong">强力</option>
+            </select>
+          </div>
+          <div class="up-opt">
+            <span>编码质量</span>
+            <select id="upQuality">
+              <option value="standard">标准（快）</option>
+              <option value="high" selected>高（推荐）</option>
+              <option value="max">极致（慢）</option>
+            </select>
+          </div>
+        </div>
+        <p class="sec-note" id="upSrcNote">正在读取源信息…</p>
+        <p class="sec-note" id="upNote">降噪要在超分之前做：AI 会把压缩块当细节一起放大</p>
         <button class="btn btn-primary wm-run" id="upRun">开始提升</button>
       </aside>
     </div>

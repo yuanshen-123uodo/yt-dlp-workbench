@@ -23,6 +23,8 @@ desktop.ini
 dist/
 build/
 *.spec
+# 但打包配置本身要进仓库：excludes 列表直接决定 exe 体积
+!yt-dlp-workbench.spec
 icon_preview.png
 
 # ---- AI 模型（运行时下载，200MB+ 不进仓库） ----

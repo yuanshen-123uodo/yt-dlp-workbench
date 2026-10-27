@@ -1049,6 +1049,25 @@ function upUpdateBadge() {
     : `${s}× 放大`;
 }
 
+/* 源信息行：把「会不会因为 HDR 变灰」「该不该开降噪」提前说清楚 */
+function upApplyProbe(p) {
+  const note = $("#upSrcNote");
+  if (!p || !p.ok) {
+    note.textContent = p?.error || "读不到源信息，将使用默认参数";
+    note.classList.remove("warn");
+    return;
+  }
+  const bits = [`${p.w}×${p.h}`];
+  if (p.codec) bits.push(p.codec.toUpperCase());
+  if (p.pix_fmt) bits.push(p.tenbit ? "10bit" : "8bit");
+  if (p.color_space) bits.push(p.color_space.toUpperCase());
+  if (p.hdr) bits.push("HDR");
+  note.textContent = bits.join(" · ") + (p.hdr ? "　→ 抽帧前自动转 SDR" : "");
+  note.classList.toggle("warn", !!p.hdr);
+  // 分辨率越低压缩痕迹越重，跟后端建议走；用户随时可以改回来
+  if (p.suggest_denoise && $("#upDenoise")) $("#upDenoise").value = p.suggest_denoise;
+}
+
 async function upscaleOpen(taskId) {
   const t = state.tasks.get(taskId);
   if (!t || !t.filename) return toast("找不到文件，可能已被移动", "err");
@@ -1063,6 +1082,15 @@ async function upscaleOpen(taskId) {
   thumb.src = "/api/thumb?path=" + encodeURIComponent(t.filename);
   $$("#upScale .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.scale === "2"));
   upUpdateBadge();
+
+  // 读源信息：HDR / 位深 / 色彩，并按分辨率给出建议降噪档
+  $("#upSrcNote").textContent = "正在读取源信息…";
+  $("#upSrcNote").classList.remove("warn");
+  api("/api/probe?path=" + encodeURIComponent(t.filename))
+    .then(upApplyProbe)
+    .catch(() => {
+      $("#upSrcNote").textContent = "读不到源信息，将使用默认参数";
+    });
 
   const info = await api("/api/upscale/status");
   upS.ready = !!info.ready;
@@ -1096,9 +1124,14 @@ function upscaleClose() {
 async function upscaleRun() {
   if (!upS.ready) return toast("请先点「下载引擎」", "warn");
   const model = $("#upModel").value;
+  const denoise = $("#upDenoise").value;
+  const sharpen = $("#upSharpen").value;
+  const quality = $("#upQuality").value;
   const btn = $("#upRun");
   btn.disabled = true;
-  const r = await api("/api/upscale/apply", { id: upS.taskId, scale: upS.scale, model });
+  const r = await api("/api/upscale/apply", {
+    id: upS.taskId, scale: upS.scale, model, denoise, sharpen, quality,
+  });
   btn.disabled = false;
   if (r.ok) {
     toast(`已开始 ${upS.scale}× 画质提升，进度看任务列表`, "ok", 4500);

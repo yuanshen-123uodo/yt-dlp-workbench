@@ -583,13 +583,27 @@ def build_cmd(task):
 WM_SIZE = {"s": (0.16, 0.07), "m": (0.22, 0.10), "l": (0.30, 0.14)}
 
 
+def probe_clean(s):
+    """ffprobe 对未知字段返回 "unknown"/"reserved"，统一成空串便于判断。"""
+    s = (s or "").strip().lower()
+    return "" if s in ("unknown", "reserved", "unspecified", "n/a", "0") else s
+
+
 def probe_video(path):
-    """读取视频宽高与时长。优先 ffprobe；没有则用 ffmpeg 解析 stderr 回退。"""
+    """读取视频宽高、时长和色彩信息。优先 ffprobe；没有则用 ffmpeg 解析 stderr 回退。
+
+    色彩字段（pix_fmt / color_space / color_transfer / color_primaries）用于两件事：
+    识别 HDR（抽帧前必须 tonemap，否则转 8bit JPEG 会变灰），以及给输出写正确的
+    颜色标记（不写容器里就是 unknown，播放器按 BT.601 解码会偏色）。
+    """
     if FFPROBE:
         try:
             r = subprocess.run(
                 [FFPROBE, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height", "-show_entries", "format=duration",
+                 "-show_entries",
+                 "stream=width,height,pix_fmt,color_space,color_transfer,"
+                 "color_primaries,color_range,codec_name",
+                 "-show_entries", "format=duration",
                  "-of", "json", path],
                 capture_output=True, timeout=60, creationflags=CREATE_NO_WINDOW,
             )
@@ -598,7 +612,15 @@ def probe_video(path):
             w, h = int(st.get("width") or 0), int(st.get("height") or 0)
             dur = float((d.get("format") or {}).get("duration") or 0)
             if w and h:
-                return {"w": w, "h": h, "duration": dur}
+                return {
+                    "w": w, "h": h, "duration": dur,
+                    "pix_fmt": probe_clean(st.get("pix_fmt")),
+                    "color_space": probe_clean(st.get("color_space")),
+                    "color_transfer": probe_clean(st.get("color_transfer")),
+                    "color_primaries": probe_clean(st.get("color_primaries")),
+                    "color_range": probe_clean(st.get("color_range")),
+                    "codec": probe_clean(st.get("codec_name")),
+                }
         except Exception:
             pass
     # 回退：ffmpeg -i 的 stderr 里就有分辨率和时长
@@ -617,7 +639,23 @@ def probe_video(path):
         dm = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", err)
         if dm:
             dur = int(dm.group(1)) * 3600 + int(dm.group(2)) * 60 + float(dm.group(3))
-        return {"w": int(m.group(1)), "h": int(m.group(2)), "duration": dur}
+        # 回退路径也尽量把色彩信息捞出来，够判断 HDR 用。
+        # ffmpeg -i 里 HDR 可能写成 smpte2084 / arib-std-b67，也可能简写成 pq / hlg
+        pm = re.search(r"Video:\s*[^,]+,\s*([a-z0-9]+)", err)
+        trc = ""
+        if re.search(r"smpte2084|\(\s*pq|/\s*pq", err):
+            trc = "smpte2084"
+        elif re.search(r"arib-std-b67|\(\s*hlg|/\s*hlg", err):
+            trc = "arib-std-b67"
+        return {
+            "w": int(m.group(1)), "h": int(m.group(2)), "duration": dur,
+            "pix_fmt": (pm.group(1).strip().lower() if pm else ""),
+            "color_space": "bt709" if "bt709" in err else ("bt2020" if "bt2020" in err else ""),
+            "color_transfer": trc,
+            "color_primaries": "bt2020" if "bt2020" in err else "",
+            "color_range": "",
+            "codec": "",
+        }
     except Exception:
         return None
 
@@ -1316,13 +1354,95 @@ def setup_upscale():
     return True, "引擎安装完成（%d 个模型，%.0f MB）" % (len(models), total / 1048576.0)
 
 
+# ---- 画质参数 ------------------------------------------------------------
+# 降噪一律放在「超分之前」：AI 会把压缩块和噪点当成细节一起放大，先压掉再放大
+# 才有效。hqdn3d 四参是 luma_spatial:chroma_spatial:luma_tmp:chroma_tmp，
+# 后两项带时域，能顺带减轻逐帧独立超分造成的轻微闪烁。
+DENOISE_PRESET = {
+    "off": "",
+    "light": "hqdn3d=1.5:1.5:6:6",
+    "medium": "hqdn3d=3:2:9:9",
+    "strong": "hqdn3d=5:3:12:12",
+}
+
+# 合帧前的锐化。cas 是对比度自适应锐化，比 unsharp 更不容易把噪点一起放大；
+# strong 改用 unsharp，是因为要的力度已经超出 cas 的舒适区。
+SHARPEN_PRESET = {
+    "off": "",
+    "light": "cas=0.3",
+    "medium": "cas=0.5",
+    "strong": "unsharp=5:5:0.8:5:5:0",
+}
+
+# 编码质量。超分后的画面高频细节密度远高于普通视频，crf 给低了等于把刚补出来的
+# 细节再糊回去，前面几小时就白跑了。
+QUALITY_PRESET = {
+    "standard": ("18", "medium"),
+    "high": ("16", "slow"),
+    "max": ("14", "slow"),
+}
+
+
+def is_hdr(info):
+    """判断是否 HDR（PQ / HLG）。10bit 不一定是 HDR，只看传输特性。"""
+    if not info:
+        return False
+    trc = probe_clean(info.get("color_transfer"))
+    return trc in ("smpte2084", "arib-std-b67", "bt2020-10", "bt2020-12")
+
+
+def grab_filter_chain(info, hdr, denoise):
+    """抽帧阶段的滤镜链：HDR→SDR 转换 + 降噪。
+
+    HDR 必须先 tonemap 再落 8bit JPEG。ffmpeg 默认的 HDR→yuv420p 只是截断，
+    高光整片压平、整体发灰发暗，这是肉眼最明显的一种「越处理越差」。
+    """
+    f = []
+    if hdr:
+        f += [
+            "zscale=t=linear:npl=100",   # 转到线性光，tonemap 必须在线性域做
+            "format=gbrpf32le",
+            "zscale=p=bt709",
+            "tonemap=hable:desat=0",     # hable 比 reinhard 保留更多高光层次
+            "zscale=t=bt709:m=bt709:r=tv",
+            "format=yuvj444p",
+        ]
+    dn = DENOISE_PRESET.get(denoise or "off") or ""
+    if dn:
+        f.append(dn)
+    return f
+
+
+def out_color_args(info, tonemapped):
+    """输出文件的颜色标记。
+
+    抽帧是 RGB、超分也是 RGB，合成时 ffmpeg 按 BT.709 算数值，但 mp4 里
+    color_space 字段留空 → 播放器普遍按 BT.601 解码 → 颜色发灰、肤色偏绿。
+    这里把标记显式写进容器，播放器才会用同一套矩阵解码。
+    """
+    if tonemapped:
+        return ["-colorspace", "bt709", "-color_primaries", "bt709",
+                "-color_trc", "bt709", "-color_range", "tv"]
+    cs = probe_clean((info or {}).get("color_space"))
+    h = int((info or {}).get("h") or 0)
+    if cs in ("bt470bg", "smpte170m", "bt601"):
+        m = "bt470bg"
+    elif cs in ("bt709", "bt470m"):
+        m = "bt709"
+    else:
+        # 源本身没标：ffmpeg 解码到 RGB 时按高度猜（>=576 用 BT.709），跟随同一规则
+        m = "bt709" if h >= 576 else "bt470bg"
+    return ["-colorspace", m, "-color_primaries", m,
+            "-color_trc", "bt709", "-color_range", "tv"]
+
+
 def upscale_space_estimate(W, H, scale, frames):
     """估算超分一段帧需要多少临时空间（字节）。
 
-    系数是实测的（JPEG q:v 2）：输入帧约 0.45 字节/像素，超分后的帧约 0.18 字节/像素
+    系数按 JPEG q:v 1 实测：输入帧约 0.60 字节/像素，超分后的帧约 0.24 字节/像素
     （超分后画面更平滑，压缩率更高）。取偏保守值，宁可提前拒绝也不要写满用户磁盘。
     """
-    per_frame = int(W) * int(H) * 0.45 + (int(W) * scale) * (int(H) * scale) * 0.18
+    per_frame = int(W) * int(H) * 0.60 + int(W) * scale * int(H) * scale * 0.24
     return int(max(1, frames) * per_frame)
 
 
@@ -1340,6 +1460,25 @@ def process_upscale(task, src, dst, opts):
         return False
     W, H = int(info["w"]), int(info["h"])
     fps = info.get("fps") or probe_fps(src)
+
+    # 画质选项：全部在服务端兜底，前端传空或传错也落回安全默认值
+    denoise = opts.get("denoise") or "off"
+    if denoise not in DENOISE_PRESET:
+        denoise = "off"
+    sharpen = opts.get("sharpen") or "medium"
+    if sharpen not in SHARPEN_PRESET:
+        sharpen = "medium"
+    quality = opts.get("quality") or "high"
+    if quality not in QUALITY_PRESET:
+        quality = "high"
+    crf, enc_preset = QUALITY_PRESET[quality]
+    sharpen_vf = SHARPEN_PRESET.get(sharpen) or ""
+
+    # HDR 源必须先 tonemap 再抽帧，否则 8bit JPEG 会把高光整片压平
+    hdr = is_hdr(info)
+    vf_chain = grab_filter_chain(info, hdr, denoise)
+    color_args = out_color_args(info, hdr)
+
     scale = int(opts.get("scale") or 2)
     if scale not in (2, 3, 4):
         scale = 2
@@ -1362,7 +1501,7 @@ def process_upscale(task, src, dst, opts):
         add_log("画质提升失败：无法创建临时目录 %s" % e, tid, "error")
         return False
 
-    CHUNK = 900  # 每块帧数；1080P 每块约 1.5–2GB 临时空间，处理完立即释放
+    CHUNK = 900  # 每块帧数；1080P 每块约 2.5–3GB 临时空间，处理完立即释放
 
     fps_v = float(fps or 25.0)
     dur = float(info.get("duration") or 0)
@@ -1379,6 +1518,9 @@ def process_upscale(task, src, dst, opts):
     add_log("画质提升：%dx%d → %dx%d，共 %d 帧，分 %d 块处理（模型 %s）"
             % (W, H, W * scale, H * scale, frames_total,
                (frames_total + CHUNK - 1) // CHUNK, model), tid)
+    add_log("画质选项：降噪 %s · 锐化 %s · 编码 crf%s/%s · 色彩 %s%s"
+            % (denoise, sharpen, crf, enc_preset,
+               "BT.709", " · HDR 源已 tonemap 转 SDR" if hdr else ""), tid)
     if free and free < need_chunk:
         add_log("画质提升失败：临时空间不足，单块约需 %.1fGB，当前可用 %.1fGB"
                 % (need_chunk / 1073741824.0, free / 1073741824.0), tid, "error")
@@ -1398,11 +1540,16 @@ def process_upscale(task, src, dst, opts):
                 safe_rmtree(d)
                 os.makedirs(d, exist_ok=True)
 
-            # 1) 抽这一块（JPEG q2）
+            # 1) 抽这一块（JPEG q:v 1；q2 的 8×8 块会被超分当成纹理学过去）
             cmd = [FFMPEG, "-y", "-v", "error"]
             if start > 0:
                 cmd += ["-ss", "%.3f" % (start / fps_v)]
-            cmd += ["-i", src, "-q:v", "2", "-frames:v", str(n),
+            cmd += ["-i", src]
+            if vf_chain:
+                cmd += ["-vf", ",".join(vf_chain)]
+            # yuvj444p：JPEG 默认按 4:2:0 存色度，抽帧时压一次、编码时再压一次，
+            # 红色文字和彩色渐变的边缘会糊两次。存 4:4:4 只多 18% 体积。
+            cmd += ["-q:v", "1", "-pix_fmt", "yuvj444p", "-frames:v", str(n),
                     os.path.join(binp, "%08d.jpg")]
             # 登记到 PROCS：否则 guard_stuck 会把长片抽帧误判为「无进度且无子进程」
             dec = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1460,12 +1607,18 @@ def process_upscale(task, src, dst, opts):
                 return False
 
             # 3) 这一块编码成独立片段（不带音频），随后立刻清掉帧
+            #    锐化放在编码前：Real-ESRGAN 是回归式超分，输出干净但偏软，
+            #    cas 能把「清晰感」提上来又不至于连噪点一起放大。
             seg = os.path.join(work, "seg%04d.mp4" % len(segs))
+            enc_cmd = [FFMPEG, "-y", "-v", "error",
+                       "-framerate", "%.6f" % fps_v,
+                       "-i", os.path.join(bout, "%08d.jpg")]
+            if sharpen_vf:
+                enc_cmd += ["-vf", sharpen_vf]
+            enc_cmd += ["-c:v", "libx264", "-preset", enc_preset, "-crf", crf,
+                        "-pix_fmt", "yuv420p"] + color_args + [seg]
             enc = subprocess.Popen(
-                [FFMPEG, "-y", "-v", "error",
-                 "-framerate", "%.6f" % fps_v, "-i", os.path.join(bout, "%08d.jpg"),
-                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                 "-pix_fmt", "yuv420p", seg],
+                enc_cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
             )
@@ -1491,12 +1644,15 @@ def process_upscale(task, src, dst, opts):
         with task_lock:
             task["percent"] = 97.0
             task["phase"] = "合并编码"
+        mux_cmd = [FFMPEG, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listf,
+                   "-i", src, "-map", "0:v:0", "-map", "1:a:0?", "-dn", "-sn",
+                   # 章节会让 mp4 封装额外写一条 text 轨道（部分播放器识别成坏字幕流），去掉
+                   "-map_chapters", "-1",
+                   "-c", "copy", "-movflags", "+faststart"]
+        # 再补一次颜色标记：concat 以第一段为准，这里确保容器里一定带 colr box
+        mux_cmd += color_args + [dst]
         mux = subprocess.Popen(
-            [FFMPEG, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listf,
-             "-i", src, "-map", "0:v:0", "-map", "1:a:0?", "-dn", "-sn",
-             # 章节会让 mp4 封装额外写一条 text 轨道（部分播放器识别成坏字幕流），去掉
-             "-map_chapters", "-1",
-             "-c", "copy", "-movflags", "+faststart", dst],
+            mux_cmd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
         )
@@ -2451,6 +2607,35 @@ class Handler(BaseHTTPRequestHandler):
                 "models": [{"name": m, "label": UP_MODEL_LABEL.get(m, m)}
                            for m in (st.get("models") or [])],
             })
+        if path == "/api/probe":
+            # 视频概要：给「画质提升」弹窗展示源信息、HDR 状态和建议档位
+            q = urlparse(self.path).query
+            target = ""
+            for part in q.split("&"):
+                if part.startswith("path="):
+                    target = unquote(part[5:])
+                    break
+            target = resolve_existing(target)
+            if not target or not os.path.isfile(target):
+                return self._send(200, {"ok": False, "error": "找不到文件"})
+            info = probe_video(target)
+            if not info or not info.get("w"):
+                return self._send(200, {"ok": False, "error": "读不到视频信息"})
+            pf = (info.get("pix_fmt") or "")
+            h = int(info["h"])
+            # 源分辨率越低，压缩块通常越重，降噪可以开大一点
+            sug = "strong" if h < 480 else ("medium" if h < 720 else "light")
+            return self._send(200, {
+                "ok": True, "w": int(info["w"]), "h": h,
+                "duration": float(info.get("duration") or 0),
+                "codec": info.get("codec") or "",
+                "pix_fmt": pf,
+                "color_space": info.get("color_space") or "",
+                "hdr": is_hdr(info),
+                "tenbit": pf.endswith(("10le", "10be", "12le", "12be")) or
+                          any(k in pf for k in ("p010", "p016", "p210", "p410")),
+                "suggest_denoise": sug,
+            })
         if path == "/api/thumb":
             # 视频首帧缩略图（编辑器 poster，打开即有画面）
             q = urlparse(self.path).query
@@ -2773,6 +2958,15 @@ class Handler(BaseHTTPRequestHandler):
             if scale not in (2, 3, 4):
                 scale = 2
             model = (body.get("model") or "").strip()
+            denoise = (body.get("denoise") or "off").strip()
+            if denoise not in DENOISE_PRESET:
+                denoise = "off"
+            sharpen = (body.get("sharpen") or "medium").strip()
+            if sharpen not in SHARPEN_PRESET:
+                sharpen = "medium"
+            quality = (body.get("quality") or "high").strip()
+            if quality not in QUALITY_PRESET:
+                quality = "high"
             opts = dict(src_task.get("opts") or {})
             t = create_task(src_task.get("url") or "", opts)
             t["filename"] = src_path
@@ -2790,7 +2984,10 @@ class Handler(BaseHTTPRequestHandler):
                 # （安全软件拦截批量删除就是这种），否则线程直接退出，任务永远卡在处理中
                 ok = False
                 try:
-                    ok = process_upscale(t, src_path, out, {"scale": scale, "model": model})
+                    ok = process_upscale(t, src_path, out, {
+                        "scale": scale, "model": model,
+                        "denoise": denoise, "sharpen": sharpen,
+                        "quality": quality})
                 except BaseException as e:
                     try:
                         add_log("画质提升异常：%s" % (e or type(e).__name__), t["id"], "error")
